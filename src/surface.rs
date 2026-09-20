@@ -21,7 +21,7 @@
 // term_app    := term_atom+
 // term_atom   := term_paren | term_pair | term_fst | term_snd | term_inl | term_inr | term_absurd | term_var
 // term_paren  := "(" term ")"
-// term_pair   := "(" term "," term ")"
+// term_pair   := "(" term ("," term)+ ")"   -- right-nested: (a,b,c) = (a,(b,c))
 // term_fst    := "fst" term_atom
 // term_snd    := "snd" term_atom
 // term_inl    := "inl" "[" type "]" term_atom
@@ -755,26 +755,38 @@ impl<'source> Parser<'source> {
     }
 
     // term_paren := "(" term ")"
-    // term_pair  := "(" term "," term ")"
+    // term_pair  := "(" term ("," term)+ ")"
     //
     // Both start with "(", so we parse the first term and then decide based on
-    // whether a "," follows.
+    // whether a "," follows. A tuple of more than two elements desugars into
+    // right-nested pairs: `(a, b, c, d)` becomes `(a, (b, (c, d)))`.
     fn parse_term_paren_or_pair(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         self.expect_token(TokenKind::LeftParen)?;
-        let first = self.parse_term()?;
-        if self.accept_token(TokenKind::Comma) {
-            let second = self.parse_term()?;
-            self.expect_token(TokenKind::RightParen)?;
-            Ok(ast::Term::Pair(ast::Pair {
-                span: self.span_from(start),
-                left: Box::new(first),
-                right: Box::new(second),
-            }))
-        } else {
-            self.expect_token(TokenKind::RightParen)?;
-            Ok(first)
+
+        let mut elements = vec![self.parse_term()?];
+        while self.accept_token(TokenKind::Comma) {
+            elements.push(self.parse_term()?);
         }
+        self.expect_token(TokenKind::RightParen)?;
+
+        // A lone parenthesised term is just grouping, not a pair.
+        if elements.len() == 1 {
+            return Ok(elements.pop().unwrap());
+        }
+
+        // Fold right into nested pairs. Every synthesised pair is given the span
+        // of the whole parenthesised expression.
+        let span = self.span_from(start);
+        let mut right = elements.pop().unwrap();
+        while let Some(left) = elements.pop() {
+            right = ast::Term::Pair(ast::Pair {
+                span,
+                left: Box::new(left),
+                right: Box::new(right),
+            });
+        }
+        Ok(right)
     }
 
     fn parse_ident(&mut self) -> Result<ast::Ident> {
@@ -987,6 +999,14 @@ mod tests {
         assert_eq!(parse_term_str("(a, b)"), "(pair a b)");
         // Arguments to a pair are full terms.
         assert_eq!(parse_term_str("(f a, g b)"), "(pair (app f a) (app g b))");
+        // Tuples of more than two elements desugar into right-nested pairs.
+        assert_eq!(parse_term_str("(a, b, c)"), "(pair a (pair b c))");
+        assert_eq!(
+            parse_term_str("(a, b, c, d)"),
+            "(pair a (pair b (pair c d)))"
+        );
+        // Explicit nesting on the left still round-trips.
+        assert_eq!(parse_term_str("((a, b), c)"), "(pair (pair a b) c)");
     }
 
     #[test]

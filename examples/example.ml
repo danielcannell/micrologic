@@ -1,7 +1,3 @@
--- The modus ponens theorem
-theorem modus_ponens : A and (A -> B) -> B :=
-    fun (h : A and (A -> B)) = (snd h) (fst h).
-
 -- Examples from CS 15-317 --------------------
 
 theorem truth : True :=
@@ -37,8 +33,20 @@ theorem impl_or_distrib : ((A or B or C) -> D) -> ((A -> D) and (B -> D) and (C 
     fun (h1 : (A or B or C) -> D) =
         (
             fun (a : A) = h1 (inl [B or C] a),
-            (
-                fun (b : B) = h1 (inr [A] inl [C] b),
-                fun (c : C) =  h1 (inr [A] inr [B] c)
-            )
+            fun (b : B) = h1 (inr [A] inl [C] b),
+            fun (c : C) =  h1 (inr [A] inr [B] c)
         ).
+
+theorem diag_and_proj : (A -> (A and A)) and ((A and A) -> A) :=
+    (
+        fun (a : A) = (a, a),
+        fun (a_and_a : A and A) = fst a_and_a
+    ).
+
+theorem double_neg : not not (A or not A) :=
+    fun (h1 : not (A or not A)) =
+        h1 (inr [A] (fun (a : A) = h1 (inl [not A] a))).
+
+theorem triple_neg_simp : not not not A -> not A :=
+    fun (h : not not not A) =
+        fun (a : A) = h (fun (h1 : not A) = h1 a).
