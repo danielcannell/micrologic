@@ -30,18 +30,7 @@
 // term_var    := IDENT
 
 use std::str::CharIndices;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct CompileError {
-    pub message: String,
-    pub span: Span,
-}
+use crate::diagnostics::{Diagnostic, Result, Span};
 
 pub mod ast {
     use crate::surface::Span;
@@ -438,7 +427,7 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '\''
 }
 
-pub fn parse(source: &str) -> Result<ast::Module, CompileError> {
+pub fn parse(source: &str) -> Result<ast::Module> {
     Parser::new(source).parse_module()
 }
 
@@ -462,7 +451,7 @@ impl<'source> Parser<'source> {
     }
 
     // module := item*
-    fn parse_module(&mut self) -> Result<ast::Module, CompileError> {
+    fn parse_module(&mut self) -> Result<ast::Module> {
         let start = self.current.span;
         let mut items = Vec::new();
 
@@ -474,16 +463,16 @@ impl<'source> Parser<'source> {
     }
 
     // item := axiom | theorem
-    fn parse_item(&mut self) -> Result<ast::Item, CompileError> {
+    fn parse_item(&mut self) -> Result<ast::Item> {
         match self.peek_token() {
             TokenKind::Axiom => Ok(ast::Item::Axiom(self.parse_axiom()?)),
             TokenKind::Theorem => Ok(ast::Item::Theorem(self.parse_theorem()?)),
-            _ => self.error("expected axiom or theorem".into(), self.current.span),
+            _ => self.unexpected("`axiom` or `theorem`"),
         }
     }
 
     // axiom := "axiom" IDENT ':' type '.'
-    fn parse_axiom(&mut self) -> Result<ast::Axiom, CompileError> {
+    fn parse_axiom(&mut self) -> Result<ast::Axiom> {
         let start = self.current.span;
         self.expect_token(TokenKind::Axiom)?;
         let name = self.parse_ident()?;
@@ -494,7 +483,7 @@ impl<'source> Parser<'source> {
     }
 
     // theorem := "theorem" IDENT ':' type ':=' term '.'
-    fn parse_theorem(&mut self) -> Result<ast::Theorem, CompileError> {
+    fn parse_theorem(&mut self) -> Result<ast::Theorem> {
         let start = self.current.span;
         self.expect_token(TokenKind::Theorem)?;
         let name = self.parse_ident()?;
@@ -509,7 +498,7 @@ impl<'source> Parser<'source> {
     // type := type_or ("->" type)?
     //
     // "->" is right-associative, so we recurse on the right.
-    fn parse_type(&mut self) -> Result<ast::Type, CompileError> {
+    fn parse_type(&mut self) -> Result<ast::Type> {
         let start = self.current.span;
         let left = self.parse_type_or()?;
         if self.accept_token(TokenKind::Arrow) {
@@ -525,7 +514,7 @@ impl<'source> Parser<'source> {
     }
 
     // type_or := type_and ("or" type_or)?
-    fn parse_type_or(&mut self) -> Result<ast::Type, CompileError> {
+    fn parse_type_or(&mut self) -> Result<ast::Type> {
         let start = self.current.span;
         let left = self.parse_type_and()?;
         if self.accept_token(TokenKind::Or) {
@@ -541,7 +530,7 @@ impl<'source> Parser<'source> {
     }
 
     // type_and := type_not ("and" type_and)?
-    fn parse_type_and(&mut self) -> Result<ast::Type, CompileError> {
+    fn parse_type_and(&mut self) -> Result<ast::Type> {
         let start = self.current.span;
         let left = self.parse_type_not()?;
         if self.accept_token(TokenKind::And) {
@@ -557,7 +546,7 @@ impl<'source> Parser<'source> {
     }
 
     // type_not := "not" type_not | type_atom
-    fn parse_type_not(&mut self) -> Result<ast::Type, CompileError> {
+    fn parse_type_not(&mut self) -> Result<ast::Type> {
         let start = self.current.span;
         if self.accept_token(TokenKind::Not) {
             let operand = self.parse_type_not()?;
@@ -572,7 +561,7 @@ impl<'source> Parser<'source> {
 
     // type_atom  := type_paren | type_true | type_false | type_ident
     // type_paren := "(" type ")"
-    fn parse_type_atom(&mut self) -> Result<ast::Type, CompileError> {
+    fn parse_type_atom(&mut self) -> Result<ast::Type> {
         let start = self.current.span;
         match self.peek_token() {
             TokenKind::LeftParen => {
@@ -596,12 +585,12 @@ impl<'source> Parser<'source> {
                     name,
                 }))
             }
-            other => self.error(format!("expected a type, but found {:?}", other), self.current.span),
+            _ => self.unexpected("a type"),
         }
     }
 
     // term := term_fun | term_case | term_app
-    fn parse_term(&mut self) -> Result<ast::Term, CompileError> {
+    fn parse_term(&mut self) -> Result<ast::Term> {
         match self.peek_token() {
             TokenKind::Fun => self.parse_term_fun(),
             TokenKind::Case => self.parse_term_case(),
@@ -610,7 +599,7 @@ impl<'source> Parser<'source> {
     }
 
     // term_fun := "fun" "(" IDENT ":" type ")" "=" term
-    fn parse_term_fun(&mut self) -> Result<ast::Term, CompileError> {
+    fn parse_term_fun(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         self.expect_token(TokenKind::Fun)?;
         self.expect_token(TokenKind::LeftParen)?;
@@ -629,7 +618,7 @@ impl<'source> Parser<'source> {
     }
 
     // term_case := "case" term "of" "|" "inl" IDENT "=>" term "|" "inr" IDENT "=>" term
-    fn parse_term_case(&mut self) -> Result<ast::Term, CompileError> {
+    fn parse_term_case(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         self.expect_token(TokenKind::Case)?;
         let either = self.parse_term()?;
@@ -657,7 +646,7 @@ impl<'source> Parser<'source> {
     // term_app := term_atom+
     //
     // Application is left-associative: `f a b` parses as `(f a) b`.
-    fn parse_term_app(&mut self) -> Result<ast::Term, CompileError> {
+    fn parse_term_app(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         let mut function = self.parse_term_atom()?;
         while self.at_term_atom_start() {
@@ -688,7 +677,7 @@ impl<'source> Parser<'source> {
 
     // term_atom := term_paren | term_pair | term_fst | term_snd | term_inl
     //            | term_inr | term_absurd | term_var
-    fn parse_term_atom(&mut self) -> Result<ast::Term, CompileError> {
+    fn parse_term_atom(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         match self.peek_token() {
             TokenKind::LeftParen => self.parse_term_paren_or_pair(),
@@ -751,7 +740,7 @@ impl<'source> Parser<'source> {
                     name,
                 }))
             }
-            other => self.error(format!("expected a term, but found {:?}", other), self.current.span),
+            _ => self.unexpected("a term"),
         }
     }
 
@@ -760,7 +749,7 @@ impl<'source> Parser<'source> {
     //
     // Both start with "(", so we parse the first term and then decide based on
     // whether a "," follows.
-    fn parse_term_paren_or_pair(&mut self) -> Result<ast::Term, CompileError> {
+    fn parse_term_paren_or_pair(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         self.expect_token(TokenKind::LeftParen)?;
         let first = self.parse_term()?;
@@ -778,7 +767,7 @@ impl<'source> Parser<'source> {
         }
     }
 
-    fn parse_ident(&mut self) -> Result<ast::Ident, CompileError> {
+    fn parse_ident(&mut self) -> Result<ast::Ident> {
         let span = self.current.span;
         let text = self.current.text.to_string();
         self.expect_token(TokenKind::Ident)?;
@@ -802,14 +791,13 @@ impl<'source> Parser<'source> {
         }
     }
 
-    fn expect_token(&mut self, kind: TokenKind) -> Result<(), CompileError> {
-        if !self.check_token(kind) {
-            let message = format!("Expected {:?}, but found {:?}", kind, self.current.kind);
-            self.error(message, self.current.span)?;
-        } else {
+    fn expect_token(&mut self, kind: TokenKind) -> Result<()> {
+        if self.check_token(kind) {
             self.advance();
+            Ok(())
+        } else {
+            self.unexpected(describe(kind))
         }
-        Ok(())
     }
 
     fn advance(&mut self) {
@@ -828,8 +816,54 @@ impl<'source> Parser<'source> {
         }
     }
 
-    fn error<T>(&mut self, message: String, span: Span) -> Result<T, CompileError> {
-        Err(CompileError { message, span })
+    /// Build an "expected X, but found Y" diagnostic pointing at the current
+    /// token, describing the current token in a reader-friendly way.
+    fn unexpected<T>(&self, expected: &str) -> Result<T> {
+        let found = match self.current.kind {
+            TokenKind::Eof => "end of input".to_string(),
+            TokenKind::InvalidToken => format!("invalid token `{}`", self.current.text),
+            _ => format!("`{}`", self.current.text),
+        };
+        Err(Diagnostic::error(
+            format!("expected {expected}, but found {found}"),
+            self.current.span,
+        ))
+    }
+}
+
+/// A reader-friendly description of a token kind, used in "expected ..." messages.
+fn describe(kind: TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Axiom => "`axiom`",
+        TokenKind::Theorem => "`theorem`",
+        TokenKind::Or => "`or`",
+        TokenKind::And => "`and`",
+        TokenKind::Not => "`not`",
+        TokenKind::True => "`True`",
+        TokenKind::False => "`False`",
+        TokenKind::Fun => "`fun`",
+        TokenKind::Case => "`case`",
+        TokenKind::Of => "`of`",
+        TokenKind::Inl => "`inl`",
+        TokenKind::Inr => "`inr`",
+        TokenKind::Fst => "`fst`",
+        TokenKind::Snd => "`snd`",
+        TokenKind::Absurd => "`absurd`",
+        TokenKind::LeftParen => "`(`",
+        TokenKind::RightParen => "`)`",
+        TokenKind::LeftBracket => "`[`",
+        TokenKind::RightBracket => "`]`",
+        TokenKind::Dot => "`.`",
+        TokenKind::Bar => "`|`",
+        TokenKind::Comma => "`,`",
+        TokenKind::Colon => "`:`",
+        TokenKind::ColonEqual => "`:=`",
+        TokenKind::Equal => "`=`",
+        TokenKind::FatArrow => "`=>`",
+        TokenKind::Arrow => "`->`",
+        TokenKind::Ident => "an identifier",
+        TokenKind::InvalidToken => "an invalid token",
+        TokenKind::Eof => "end of input",
     }
 }
 

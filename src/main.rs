@@ -1,6 +1,7 @@
 // Not yet consumed by `main`; the lowering pass will use it.
 #[allow(dead_code)]
 pub mod surface;
+pub mod diagnostics;
 
 use std::fmt::Display;
 use std::rc::Rc;
