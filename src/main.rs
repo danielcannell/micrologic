@@ -4,7 +4,10 @@ pub mod surface;
 pub mod diagnostics;
 
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::rc::Rc;
+
+use clap::Parser;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[allow(unused)]
@@ -374,44 +377,171 @@ fn check(ctx: &Context, term: &Term, term_type: Type) -> Result<(), String> {
     Ok(())
 }
 
+fn lower_type(typ: &surface::ast::Type) -> Type {
+    match typ {
+        surface::ast::Type::Lambda(lambda) => { lower_type_lambda(lambda) }
+        surface::ast::Type::Or(or) => { lower_type_or(or) }
+        surface::ast::Type::And(and) => { lower_type_and(and) }
+        surface::ast::Type::Not(not) => { lower_type_not(not) }
+        surface::ast::Type::True(t) => { lower_type_true(t) }
+        surface::ast::Type::False(f) => { lower_type_false(f) }
+        surface::ast::Type::Atom(atom) => { lower_type_atom(atom) }
+    }
+}
+
+fn lower_type_lambda(lambda: &surface::ast::Lambda) -> Type {
+    let argument_type = Box::new(lower_type(&lambda.argument_type));
+    let result_type = Box::new(lower_type(&lambda.result_type));
+    Type::Lambda { argument_type, result_type }
+}
+
+fn lower_type_or(or: &surface::ast::Or) -> Type {
+    let left_type = Box::new(lower_type(&or.left));
+    let right_type = Box::new(lower_type(&or.right));
+    Type::Either { left_type, right_type }
+}
+
+fn lower_type_and(and: &surface::ast::And) -> Type {
+    let left_type = Box::new(lower_type(&and.left));
+    let right_type = Box::new(lower_type(&and.right));
+    Type::Pair { left_type, right_type }
+}
+
+fn lower_type_not(not: &surface::ast::Not) -> Type {
+    let argument_type = Box::new(lower_type(&not.operand));
+    let result_type = Box::new(Type::False);
+    Type::Lambda { argument_type, result_type }
+}
+
+fn lower_type_true(_: &surface::ast::True) -> Type {
+    let argument_type = Box::new(Type::False);
+    let result_type = Box::new(Type::False);
+    Type::Lambda { argument_type, result_type }
+}
+
+fn lower_type_false(_: &surface::ast::False) -> Type {
+    Type::False
+}
+
+fn lower_type_atom(atom: &surface::ast::Atom) -> Type {
+    let name = atom.name.text.clone();
+    Type::Atom { name }
+}
+
+fn lower_term(term: &surface::ast::Term) -> Term {
+    match term {
+        surface::ast::Term::Var(var) => { lower_term_var(var) }
+        surface::ast::Term::Fun(fun) => { lower_term_fun(fun) }
+        surface::ast::Term::App(app) => { lower_term_app(app) }
+        surface::ast::Term::Pair(pair) => { lower_term_pair(pair) }
+        surface::ast::Term::Fst(fst) => { lower_term_fst(fst) }
+        surface::ast::Term::Snd(snd) => { lower_term_snd(snd) }
+        surface::ast::Term::Inl(inl) => { lower_term_inl(inl) }
+        surface::ast::Term::Inr(inr) => { lower_term_inr(inr) }
+        surface::ast::Term::Case(case) => { lower_term_case(case) }
+        surface::ast::Term::Absurd(absurd) => { lower_term_absurd(absurd) }
+    }
+}
+
+fn lower_term_var(var: &surface::ast::Var) -> Term {
+    let name = var.name.text.clone();
+    Term::Var { name }
+}
+
+fn lower_term_fun(fun: &surface::ast::Fun) -> Term {
+    let argument = fun.argument.text.clone();
+    let argument_type = lower_type(&fun.argument_type);
+    let body = Box::new(lower_term(&fun.body));
+    Term::Lambda { argument, argument_type, body }
+}
+
+fn lower_term_app(app: &surface::ast::App) -> Term {
+    let function = Box::new(lower_term(&app.function));
+    let argument = Box::new(lower_term(&app.argument));
+    Term::Application { function, argument }
+}
+
+fn lower_term_pair(pair: &surface::ast::Pair) -> Term {
+    let left = Box::new(lower_term(&pair.left));
+    let right = Box::new(lower_term(&pair.right));
+    Term::Pair { left, right }
+}
+
+fn lower_term_fst(fst: &surface::ast::Fst) -> Term {
+    let pair = Box::new(lower_term(&fst.pair));
+    Term::Fst { pair }
+}
+
+fn lower_term_snd(snd: &surface::ast::Snd) -> Term {
+    let pair = Box::new(lower_term(&snd.pair));
+    Term::Snd { pair }
+}
+
+fn lower_term_inl(inl: &surface::ast::Inl) -> Term {
+    let right_type = lower_type(&inl.right_type);
+    let left = Box::new(lower_term(&inl.left));
+    Term::Inl { right_type, left }
+}
+
+fn lower_term_inr(inr: &surface::ast::Inr) -> Term {
+    let left_type = lower_type(&inr.left_type);
+    let right = Box::new(lower_term(&inr.right));
+    Term::Inr { left_type, right }
+}
+
+fn lower_term_case(case: &surface::ast::Case) -> Term {
+    let either = Box::new(lower_term(&case.either));
+    let left_name = case.left_name.text.clone();
+    let left_body = Box::new(lower_term(&case.left_body));
+    let right_name = case.right_name.text.clone();
+    let right_body = Box::new(lower_term(&case.right_body));
+    Term::Case { either, left_name, left_body, right_name, right_body }
+}
+
+fn lower_term_absurd(absurd: &surface::ast::Absurd) -> Term {
+    let goal_type = lower_type(&absurd.goal_type);
+    let body = Box::new(lower_term(&absurd.body));
+    Term::Absurd { goal_type, body }
+}
+
+#[derive(Parser)]
+struct Args {
+    /// Source file to check
+    source_file: PathBuf,
+}
+
 fn main() {
-    let a = Type::Atom {
-        name: "A".to_string(),
-    };
-    let b = Type::Atom {
-        name: "B".to_string(),
-    };
-    let a_imp_b = Type::Lambda {
-        argument_type: Box::new(a.clone()),
-        result_type: Box::new(b.clone()),
-    };
-    let a_and_a_imp_b = Type::Pair {
-        left_type: Box::new(a.clone()),
-        right_type: Box::new(a_imp_b.clone()),
-    };
-    let a_and_a_imp_b_imp_b = Type::Lambda {
-        argument_type: Box::new(a_and_a_imp_b.clone()),
-        result_type: Box::new(b.clone()),
-    };
-    let h = Term::Var {
-        name: "h".to_string(),
-    };
-    let snd_h = Term::Snd {
-        pair: Box::new(h.clone()),
-    };
-    let fst_h = Term::Fst {
-        pair: Box::new(h.clone()),
-    };
-    let snd_h_fst_h = Term::Application {
-        function: Box::new(snd_h),
-        argument: Box::new(fst_h),
-    };
-    let mp = Term::Lambda {
-        argument: "h".to_string(),
-        argument_type: a_and_a_imp_b.clone(),
-        body: Box::new(snd_h_fst_h.clone()),
+    let args = Args::parse();
+
+    let source = std::fs::read_to_string(&args.source_file).expect("Could not read source file");
+
+    let module = match surface::parse(&source) {
+        Ok(module) => module,
+        Err(diag) => { diag.emit(&source); std::process::exit(1); }
     };
 
-    let ctx = Context::new();
-    check(&ctx, &mp, a_and_a_imp_b_imp_b.clone()).unwrap();
+    let mut ctx = Context::new();
+
+    for item in &module.items {
+        match item {
+            surface::ast::Item::Axiom(axiom) => {
+                let typ = lower_type(&axiom.typ);
+                println!("axiom {} : {}", axiom.name.text, typ);
+                ctx = ctx.bind(axiom.name.text.clone(), typ);
+            }
+            surface::ast::Item::Theorem(theorem) => {
+                let typ = lower_type(&theorem.typ);
+                let body = lower_term(&theorem.body);
+                match check(&ctx, &body, typ.clone()) {
+                    Ok(()) => {
+                        println!("ok {} : {}", theorem.name.text, typ);
+                    }
+                    Err(err) => {
+                        println!("err {} : {}", theorem.name.text, err);
+                    }
+                }
+                ctx = ctx.bind(theorem.name.text.clone(), typ);
+            }
+        }
+    }
 }

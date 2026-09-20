@@ -70,8 +70,8 @@ pub mod ast {
         Or(Or),
         And(And),
         Not(Not),
-        True,
-        False,
+        True(True),
+        False(False),
         Atom(Atom),
     }
 
@@ -104,6 +104,16 @@ pub mod ast {
     pub struct Not {
         pub span: Span,
         pub operand: Box<Type>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct True {
+        pub span: Span,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct False {
+        pub span: Span,
     }
 
     /// `name`
@@ -572,11 +582,11 @@ impl<'source> Parser<'source> {
             }
             TokenKind::True => {
                 self.advance();
-                Ok(ast::Type::True)
+                Ok(ast::Type::True(ast::True { span: start }))
             }
             TokenKind::False => {
                 self.advance();
-                Ok(ast::Type::False)
+                Ok(ast::Type::False(ast::False { span: start }))
             }
             TokenKind::Ident => {
                 let name = self.parse_ident()?;
@@ -881,8 +891,8 @@ mod tests {
             ast::Type::Or(o) => format!("(or {} {})", show_type(&o.left), show_type(&o.right)),
             ast::Type::And(a) => format!("(and {} {})", show_type(&a.left), show_type(&a.right)),
             ast::Type::Not(n) => format!("(not {})", show_type(&n.operand)),
-            ast::Type::True => "True".to_string(),
-            ast::Type::False => "False".to_string(),
+            ast::Type::True(_) => "True".to_string(),
+            ast::Type::False(_) => "False".to_string(),
             ast::Type::Atom(a) => a.name.text.clone(),
         }
     }
