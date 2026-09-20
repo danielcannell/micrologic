@@ -1,28 +1,47 @@
+// Not yet consumed by `main`; the lowering pass will use it.
+#[allow(dead_code)]
+pub mod surface;
+
 use std::fmt::Display;
 use std::rc::Rc;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[allow(unused)]
 enum Type {
+    // `A`
+    //
+    // Corresponds to a proposition
     Atom {
         name: String,
     },
 
+    // `A -> B`
+    //
+    // Corresponds to implication
     Lambda {
         argument_type: Box<Type>,
         result_type: Box<Type>,
     },
 
+    // `Pair A B`
+    //
+    // Corresponds to conjunction
     Pair {
         left_type: Box<Type>,
         right_type: Box<Type>,
     },
 
+    // `Either A B`
+    //
+    // Corresponds to disjunction
     Either {
         left_type: Box<Type>,
         right_type: Box<Type>,
     },
 
+    // `False`
+    //
+    // Corresponds to false. True is represented as `False -> False`
     False,
 }
 
@@ -141,7 +160,7 @@ enum Term {
     /// for bidirectional inference for now.
     Inr { left_type: Type, right: Box<Term> },
 
-    /// `case t of | inl x => u | inr y => v end`
+    /// `case t of | inl x => u | inr y => v`
     ///
     /// Corresponds to disjunction elimination
     Case {
