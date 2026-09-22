@@ -180,6 +180,11 @@ enum Term {
     /// Corresponds to false elimination. The goal type is annotated to avoid the need for
     /// bidirectional inference for now.
     Absurd { goal_type: Type, body: Box<Term> },
+
+    /// `trustme [A]`
+    ///
+    /// Corresponds to the assumption that A is true. Used as a placeholder.
+    TrustMe { goal_type: Type },
 }
 
 #[derive(Debug, Clone)]
@@ -363,6 +368,10 @@ fn infer(ctx: &Context, term: &Term) -> Result<Type, String> {
                 )),
             }
         }
+
+        Term::TrustMe { goal_type } => {
+            Ok(goal_type.clone())
+        }
     }
 }
 
@@ -440,6 +449,7 @@ fn lower_term(term: &surface::ast::Term) -> Term {
         surface::ast::Term::Inr(inr) => { lower_term_inr(inr) }
         surface::ast::Term::Case(case) => { lower_term_case(case) }
         surface::ast::Term::Absurd(absurd) => { lower_term_absurd(absurd) }
+        surface::ast::Term::TrustMe(trustme) => { lower_term_trustme(trustme) }
     }
 }
 
@@ -502,6 +512,11 @@ fn lower_term_absurd(absurd: &surface::ast::Absurd) -> Term {
     let goal_type = lower_type(&absurd.goal_type);
     let body = Box::new(lower_term(&absurd.body));
     Term::Absurd { goal_type, body }
+}
+
+fn lower_term_trustme(trustme: &surface::ast::TrustMe) -> Term {
+    let goal_type = lower_type(&trustme.goal_type);
+    Term::TrustMe { goal_type }
 }
 
 #[derive(Parser)]

@@ -15,19 +15,20 @@
 // type_false := "False"
 // type_ident := IDENT
 //
-// term        := term_fun | term_case | term_app
-// term_fun    := "fun" "(" IDENT ":" type ")" "=" term
-// term_case   := "case" term "of" "|" "inl" IDENT "=>" term "|" "inr" IDENT "=>" term
-// term_app    := term_atom+
-// term_atom   := term_paren | term_pair | term_fst | term_snd | term_inl | term_inr | term_absurd | term_var
-// term_paren  := "(" term ")"
-// term_pair   := "(" term ("," term)+ ")"   -- right-nested: (a,b,c) = (a,(b,c))
-// term_fst    := "fst" term_atom
-// term_snd    := "snd" term_atom
-// term_inl    := "inl" "[" type "]" term_atom
-// term_inr    := "inr" "[" type "]" term_atom
-// term_absurd := "absurd" "[" type "]" term_atom
-// term_var    := IDENT
+// term         := term_fun | term_case | term_app
+// term_fun     := "fun" "(" IDENT ":" type ")" "=" term
+// term_case    := "case" term "of" "|" "inl" IDENT "=>" term "|" "inr" IDENT "=>" term
+// term_app     := term_atom+
+// term_atom    := term_paren | term_pair | term_fst | term_snd | term_inl | term_inr | term_absurd | term_trustme | term_var
+// term_paren   := "(" term ")"
+// term_pair    := "(" term ("," term)+ ")"   -- right-nested: (a,b,c) = (a,(b,c))
+// term_fst     := "fst" term_atom
+// term_snd     := "snd" term_atom
+// term_inl     := "inl" "[" type "]" term_atom
+// term_inr     := "inr" "[" type "]" term_atom
+// term_absurd  := "absurd" "[" type "]" term_atom
+// term_trustme := "trustme" "[" type "]"
+// term_var     := IDENT
 
 use std::str::CharIndices;
 use crate::diagnostics::{Diagnostic, Result, Span};
@@ -135,6 +136,7 @@ pub mod ast {
         Inr(Inr),
         Case(Case),
         Absurd(Absurd),
+        TrustMe(TrustMe),
     }
 
     /// `name`
@@ -218,6 +220,13 @@ pub mod ast {
         pub body: Box<Term>,
     }
 
+    /// `trustme [goal_type]`
+    #[derive(Debug, Clone)]
+    pub struct TrustMe {
+        pub span: Span,
+        pub goal_type: Type,
+    }
+
     /// `name`
     #[derive(Debug, Clone)]
     pub struct Ident {
@@ -244,6 +253,7 @@ pub enum TokenKind {
     Fst,     // "fst"
     Snd,     // "snd"
     Absurd,  // "absurd"
+    TrustMe, // "trustme"
 
     // Delimiters
     LeftParen,    // '('
@@ -373,6 +383,7 @@ impl<'source> Lexer<'source> {
                         "fst" => TokenKind::Fst,
                         "snd" => TokenKind::Snd,
                         "absurd" => TokenKind::Absurd,
+                        "trustme" => TokenKind::TrustMe,
                         _ => TokenKind::Ident,
                     }
                 }
@@ -617,7 +628,7 @@ impl<'source> Parser<'source> {
         self.expect_token(TokenKind::Colon)?;
         let argument_type = self.parse_type()?;
         self.expect_token(TokenKind::RightParen)?;
-        self.expect_token(TokenKind::Equal)?;
+        self.expect_token(TokenKind::FatArrow)?;
         let body = self.parse_term()?;
         Ok(ast::Term::Fun(ast::Fun {
             span: self.span_from(start),
@@ -681,12 +692,13 @@ impl<'source> Parser<'source> {
                 | TokenKind::Inl
                 | TokenKind::Inr
                 | TokenKind::Absurd
+                | TokenKind::TrustMe
                 | TokenKind::Ident
         )
     }
 
     // term_atom := term_paren | term_pair | term_fst | term_snd | term_inl
-    //            | term_inr | term_absurd | term_var
+    //            | term_inr | term_absurd | term_trustme | term_var
     fn parse_term_atom(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         match self.peek_token() {
@@ -741,6 +753,16 @@ impl<'source> Parser<'source> {
                     span: self.span_from(start),
                     goal_type,
                     body: Box::new(body),
+                }))
+            }
+            TokenKind::TrustMe => {
+                self.expect_token(TokenKind::TrustMe)?;
+                self.expect_token(TokenKind::LeftBracket)?;
+                let goal_type = self.parse_type()?;
+                self.expect_token(TokenKind::RightBracket)?;
+                Ok(ast::Term::TrustMe(ast::TrustMe {
+                    span: self.span_from(start),
+                    goal_type,
                 }))
             }
             TokenKind::Ident => {
@@ -871,6 +893,7 @@ fn describe(kind: TokenKind) -> &'static str {
         TokenKind::Fst => "`fst`",
         TokenKind::Snd => "`snd`",
         TokenKind::Absurd => "`absurd`",
+        TokenKind::TrustMe => "`trustme`",
         TokenKind::LeftParen => "`(`",
         TokenKind::RightParen => "`)`",
         TokenKind::LeftBracket => "`[`",
@@ -936,6 +959,9 @@ mod tests {
             ),
             ast::Term::Absurd(a) => {
                 format!("(absurd [{}] {})", show_type(&a.goal_type), show_term(&a.body))
+            }
+            ast::Term::TrustMe(tm) => {
+                format!("(trustme [{}])", show_type(&tm.goal_type))
             }
         }
     }
@@ -1018,10 +1044,11 @@ mod tests {
     }
 
     #[test]
-    fn test_term_injections_and_absurd() {
+    fn test_term_injections_and_absurd_and_trustme() {
         assert_eq!(parse_term_str("inl [B] a"), "(inl [B] a)");
         assert_eq!(parse_term_str("inr [A] b"), "(inr [A] b)");
         assert_eq!(parse_term_str("absurd [A -> B] x"), "(absurd [(-> A B)] x)");
+        assert_eq!(parse_term_str("trustme [A -> B]"), "(trustme [(-> A B)])");
     }
 
     #[test]
@@ -1083,7 +1110,7 @@ mod tests {
             fun
             case of inl inr
             fst snd
-            absurd
+            absurd trustme
             ()[]
             .|,: := = => ->
             foo_bar_1'
@@ -1105,6 +1132,7 @@ mod tests {
             (TokenKind::Fst, "fst"),
             (TokenKind::Snd, "snd"),
             (TokenKind::Absurd, "absurd"),
+            (TokenKind::TrustMe, "trustme"),
             (TokenKind::LeftParen, "("),
             (TokenKind::RightParen, ")"),
             (TokenKind::LeftBracket, "["),
