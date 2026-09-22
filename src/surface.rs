@@ -30,8 +30,8 @@
 // term_trustme := "trustme" "[" type "]"
 // term_var     := IDENT
 
-use std::str::CharIndices;
 use crate::diagnostics::{Diagnostic, Result, Span};
+use std::str::CharIndices;
 
 pub mod ast {
     use crate::surface::Span;
@@ -452,7 +452,7 @@ pub fn parse(source: &str) -> Result<ast::Module> {
     Parser::new(source).parse_module()
 }
 
-struct Parser <'source> {
+struct Parser<'source> {
     lexer: Lexer<'source>,
     current: Token<'source>,
     previous: Token<'source>,
@@ -480,7 +480,10 @@ impl<'source> Parser<'source> {
             items.push(self.parse_item()?);
         }
 
-        Ok(ast::Module { span: self.span_from(start), items })
+        Ok(ast::Module {
+            span: self.span_from(start),
+            items,
+        })
     }
 
     // item := axiom | theorem
@@ -500,7 +503,11 @@ impl<'source> Parser<'source> {
         self.expect_token(TokenKind::Colon)?;
         let typ = self.parse_type()?;
         self.expect_token(TokenKind::Dot)?;
-        Ok(ast::Axiom { span: self.span_from(start), name, typ })
+        Ok(ast::Axiom {
+            span: self.span_from(start),
+            name,
+            typ,
+        })
     }
 
     // theorem := "theorem" IDENT ':' type ':=' term '.'
@@ -513,7 +520,12 @@ impl<'source> Parser<'source> {
         self.expect_token(TokenKind::ColonEqual)?;
         let body = self.parse_term()?;
         self.expect_token(TokenKind::Dot)?;
-        Ok(ast::Theorem { span: self.span_from(start), name, typ, body })
+        Ok(ast::Theorem {
+            span: self.span_from(start),
+            name,
+            typ,
+            body,
+        })
     }
 
     // type := type_or ("->" type)?
@@ -914,14 +926,18 @@ fn describe(kind: TokenKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::surface::{ast, parse, Lexer, TokenKind};
+    use crate::surface::{Lexer, TokenKind, ast, parse};
 
     // Render a type as a fully-parenthesized s-expression so tests can assert
     // on structure (precedence and associativity) without depending on spans.
     fn show_type(typ: &ast::Type) -> String {
         match typ {
             ast::Type::Lambda(l) => {
-                format!("(-> {} {})", show_type(&l.argument_type), show_type(&l.result_type))
+                format!(
+                    "(-> {} {})",
+                    show_type(&l.argument_type),
+                    show_type(&l.result_type)
+                )
             }
             ast::Type::Or(o) => format!("(or {} {})", show_type(&o.left), show_type(&o.right)),
             ast::Type::And(a) => format!("(and {} {})", show_type(&a.left), show_type(&a.right)),
@@ -942,13 +958,25 @@ mod tests {
                 show_term(&f.body)
             ),
             ast::Term::App(a) => {
-                format!("(app {} {})", show_term(&a.function), show_term(&a.argument))
+                format!(
+                    "(app {} {})",
+                    show_term(&a.function),
+                    show_term(&a.argument)
+                )
             }
             ast::Term::Pair(p) => format!("(pair {} {})", show_term(&p.left), show_term(&p.right)),
             ast::Term::Fst(f) => format!("(fst {})", show_term(&f.pair)),
             ast::Term::Snd(s) => format!("(snd {})", show_term(&s.pair)),
-            ast::Term::Inl(i) => format!("(inl [{}] {})", show_type(&i.right_type), show_term(&i.left)),
-            ast::Term::Inr(i) => format!("(inr [{}] {})", show_type(&i.left_type), show_term(&i.right)),
+            ast::Term::Inl(i) => format!(
+                "(inl [{}] {})",
+                show_type(&i.right_type),
+                show_term(&i.left)
+            ),
+            ast::Term::Inr(i) => format!(
+                "(inr [{}] {})",
+                show_type(&i.left_type),
+                show_term(&i.right)
+            ),
             ast::Term::Case(c) => format!(
                 "(case {} inl {} => {} inr {} => {})",
                 show_term(&c.either),
@@ -958,7 +986,11 @@ mod tests {
                 show_term(&c.right_body),
             ),
             ast::Term::Absurd(a) => {
-                format!("(absurd [{}] {})", show_type(&a.goal_type), show_term(&a.body))
+                format!(
+                    "(absurd [{}] {})",
+                    show_type(&a.goal_type),
+                    show_term(&a.body)
+                )
             }
             ast::Term::TrustMe(tm) => {
                 format!("(trustme [{}])", show_type(&tm.goal_type))
@@ -990,7 +1022,10 @@ mod tests {
     #[test]
     fn test_type_precedence() {
         // `and` binds tighter than `or`, which binds tighter than `->`.
-        assert_eq!(parse_type_str("A and B or C -> D"), "(-> (or (and A B) C) D)");
+        assert_eq!(
+            parse_type_str("A and B or C -> D"),
+            "(-> (or (and A B) C) D)"
+        );
         // `not` binds tightest.
         assert_eq!(parse_type_str("not A and B"), "(and (not A) B)");
         assert_eq!(parse_type_str("not not A"), "(not (not A))");

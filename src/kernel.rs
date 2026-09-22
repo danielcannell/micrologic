@@ -179,31 +179,55 @@ pub enum Term {
     TrustMe { goal_type: Type },
 }
 
+/// Whether a proof is complete or relies on a `trustme`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trust {
+    /// Fully checked.
+    Proved,
+    /// Depends on at least one `trustme`.
+    Admitted,
+}
+
+impl Trust {
+    fn admit(&mut self, other: Trust) {
+        if other == Trust::Admitted {
+            *self = Trust::Admitted;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ContextInner {
     Empty,
     Binding {
         name: String,
         typ: Type,
+        trust: Trust,
         parent: Rc<ContextInner>,
     },
 }
 
 impl ContextInner {
-    fn bind(self: Rc<Self>, name: String, typ: Type) -> Rc<Self> {
+    fn bind(self: Rc<Self>, name: String, typ: Type, trust: Trust) -> Rc<Self> {
         Rc::new(ContextInner::Binding {
             name,
             typ,
+            trust,
             parent: self,
         })
     }
 
-    fn lookup(&self, n: &str) -> Option<Type> {
+    fn lookup(&self, n: &str) -> Option<(Type, Trust)> {
         match self {
             ContextInner::Empty => None,
-            ContextInner::Binding { name, typ, parent } => {
+            ContextInner::Binding {
+                name,
+                typ,
+                trust,
+                parent,
+            } => {
                 if name == n {
-                    Some(typ.clone())
+                    Some((typ.clone(), *trust))
                 } else {
                     parent.lookup(n)
                 }
@@ -221,10 +245,14 @@ impl Context {
     }
 
     pub fn bind(&self, name: String, typ: Type) -> Self {
-        Context(self.0.clone().bind(name, typ))
+        self.bind_with_trust(name, typ, Trust::Proved)
     }
 
-    pub fn lookup(&self, name: &str) -> Option<Type> {
+    pub fn bind_with_trust(&self, name: String, typ: Type, trust: Trust) -> Self {
+        Context(self.0.clone().bind(name, typ, trust))
+    }
+
+    pub fn lookup(&self, name: &str) -> Option<(Type, Trust)> {
         self.0.lookup(name)
     }
 }
@@ -235,19 +263,27 @@ impl Default for Context {
     }
 }
 
-fn infer(ctx: &Context, term: &Term) -> Result<Type, String> {
+fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> {
     match term {
-        Term::Var { name } => ctx
-            .lookup(name)
-            .ok_or_else(|| format!("Unknown variable {}", name)),
+        Term::Var { name } => {
+            let (typ, binding_trust) = ctx
+                .lookup(name)
+                .ok_or_else(|| format!("Unknown variable {}", name))?;
+            // Referring to an admitted theorem taints this proof too.
+            trust.admit(binding_trust);
+            Ok(typ)
+        }
 
         Term::Lambda {
             argument,
             argument_type,
             body,
         } => {
-            let result_type_inferred =
-                infer(&ctx.bind(argument.clone(), argument_type.clone()), body)?;
+            let result_type_inferred = infer(
+                &ctx.bind(argument.clone(), argument_type.clone()),
+                body,
+                trust,
+            )?;
             Ok(Type::Lambda {
                 argument_type: Box::new(argument_type.clone()),
                 result_type: Box::new(result_type_inferred),
@@ -255,8 +291,8 @@ fn infer(ctx: &Context, term: &Term) -> Result<Type, String> {
         }
 
         Term::Application { function, argument } => {
-            let function_type_inferred = infer(ctx, function)?;
-            let argument_type_inferred = infer(ctx, argument)?;
+            let function_type_inferred = infer(ctx, function, trust)?;
+            let argument_type_inferred = infer(ctx, argument, trust)?;
 
             if let Type::Lambda {
                 argument_type,
@@ -283,11 +319,11 @@ fn infer(ctx: &Context, term: &Term) -> Result<Type, String> {
             left: lhs,
             right: rhs,
         } => Ok(Type::Pair {
-            left_type: Box::new(infer(ctx, lhs)?),
-            right_type: Box::new(infer(ctx, rhs)?),
+            left_type: Box::new(infer(ctx, lhs, trust)?),
+            right_type: Box::new(infer(ctx, rhs, trust)?),
         }),
 
-        Term::Fst { pair } => match infer(ctx, pair)? {
+        Term::Fst { pair } => match infer(ctx, pair, trust)? {
             Type::Pair { left_type, .. } => Ok(*left_type),
             other => Err(format!(
                 "Incorrect type in fst: expected Pair but got {}",
@@ -295,7 +331,7 @@ fn infer(ctx: &Context, term: &Term) -> Result<Type, String> {
             )),
         },
 
-        Term::Snd { pair } => match infer(ctx, pair)? {
+        Term::Snd { pair } => match infer(ctx, pair, trust)? {
             Type::Pair { right_type, .. } => Ok(*right_type),
             other => Err(format!(
                 "Incorrect type in snd: expected Pair but got {}",
@@ -304,7 +340,7 @@ fn infer(ctx: &Context, term: &Term) -> Result<Type, String> {
         },
 
         Term::Inl { right_type, left } => {
-            let left_type_inferred = infer(ctx, left)?;
+            let left_type_inferred = infer(ctx, left, trust)?;
             Ok(Type::Either {
                 left_type: Box::new(left_type_inferred),
                 right_type: Box::new(right_type.clone()),
@@ -312,7 +348,7 @@ fn infer(ctx: &Context, term: &Term) -> Result<Type, String> {
         }
 
         Term::Inr { left_type, right } => {
-            let right_type_inferred = infer(ctx, right)?;
+            let right_type_inferred = infer(ctx, right, trust)?;
             Ok(Type::Either {
                 left_type: Box::new(left_type.clone()),
                 right_type: Box::new(right_type_inferred),
@@ -326,7 +362,7 @@ fn infer(ctx: &Context, term: &Term) -> Result<Type, String> {
             right_name,
             right_body,
         } => {
-            let either_type = infer(ctx, either)?;
+            let either_type = infer(ctx, either, trust)?;
             let (left_type, right_type) = match either_type {
                 Type::Either {
                     left_type,
@@ -341,10 +377,13 @@ fn infer(ctx: &Context, term: &Term) -> Result<Type, String> {
             };
 
             let left_body_type_inferred =
-                infer(&ctx.bind(left_name.clone(), *left_type), left_body)?;
+                infer(&ctx.bind(left_name.clone(), *left_type), left_body, trust)?;
 
-            let right_body_type_inferred =
-                infer(&ctx.bind(right_name.clone(), *right_type), right_body)?;
+            let right_body_type_inferred = infer(
+                &ctx.bind(right_name.clone(), *right_type),
+                right_body,
+                trust,
+            )?;
 
             if left_body_type_inferred == right_body_type_inferred {
                 Ok(left_body_type_inferred)
@@ -357,7 +396,7 @@ fn infer(ctx: &Context, term: &Term) -> Result<Type, String> {
         }
 
         Term::Absurd { goal_type, body } => {
-            let body_type = infer(ctx, body)?;
+            let body_type = infer(ctx, body, trust)?;
             match body_type {
                 Type::False => Ok(goal_type.clone()),
                 other => Err(format!(
@@ -368,18 +407,21 @@ fn infer(ctx: &Context, term: &Term) -> Result<Type, String> {
         }
 
         Term::TrustMe { goal_type } => {
+            // Infer the requested type, but taint the proof.
+            *trust = Trust::Admitted;
             Ok(goal_type.clone())
         }
     }
 }
 
-pub fn check(ctx: &Context, term: &Term, term_type: Type) -> Result<(), String> {
-    let term_type_inferred = infer(ctx, term)?;
+pub fn check(ctx: &Context, term: &Term, term_type: Type) -> Result<Trust, String> {
+    let mut trust = Trust::Proved;
+    let term_type_inferred = infer(ctx, term, &mut trust)?;
     if term_type_inferred != term_type {
         return Err(format!(
             "Incorrect type: expected {} but got {}",
             term_type, term_type_inferred
         ));
     }
-    Ok(())
+    Ok(trust)
 }

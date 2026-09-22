@@ -83,12 +83,12 @@ impl Diagnostic {
             .map(|label| Range::from(label.span))
             .unwrap_or(0..0);
 
-        let mut builder =
-            Report::build(ReportKind::Error, primary).with_message(&self.message);
+        let mut builder = Report::build(ReportKind::Error, primary).with_message(&self.message);
 
         for label in &self.labels {
-            builder = builder
-                .with_label(AriadneLabel::new(Range::from(label.span)).with_message(&label.message));
+            builder = builder.with_label(
+                AriadneLabel::new(Range::from(label.span)).with_message(&label.message),
+            );
         }
         for note in &self.notes {
             builder = builder.with_note(note);
