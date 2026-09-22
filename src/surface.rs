@@ -16,7 +16,7 @@
 // type_ident := IDENT
 //
 // term         := term_fun | term_case | term_app
-// term_fun     := "fun" "(" IDENT ":" type ")" "=" term
+// term_fun     := "fun" "(" IDENT ":" type ")" "=>" term
 // term_case    := "case" term "of" "|" "inl" IDENT "=>" term "|" "inr" IDENT "=>" term
 // term_app     := term_atom+
 // term_atom    := term_paren | term_pair | term_fst | term_snd | term_inl | term_inr | term_absurd | term_trustme | term_var
@@ -146,7 +146,7 @@ pub mod ast {
         pub name: Ident,
     }
 
-    /// `fun (argument : argument_type) = body`
+    /// `fun (argument : argument_type) => body`
     #[derive(Debug, Clone)]
     pub struct Fun {
         pub span: Span,
@@ -619,7 +619,7 @@ impl<'source> Parser<'source> {
         }
     }
 
-    // term_fun := "fun" "(" IDENT ":" type ")" "=" term
+    // term_fun := "fun" "(" IDENT ":" type ")" "=>" term
     fn parse_term_fun(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         self.expect_token(TokenKind::Fun)?;
@@ -1054,7 +1054,7 @@ mod tests {
     #[test]
     fn test_term_fun_and_case() {
         assert_eq!(
-            parse_term_str("fun (x : A -> B) = x"),
+            parse_term_str("fun (x : A -> B) => x"),
             "(fun x : (-> A B) x)"
         );
         assert_eq!(
@@ -1069,7 +1069,7 @@ mod tests {
             -- The modus ponens theorem
             axiom a : A.
             theorem mp : A and (A -> B) -> B :=
-                fun (h : A and (A -> B)) = (snd h) (fst h).
+                fun (h : A and (A -> B)) => (snd h) (fst h).
         "#;
         let module = parse(source).expect("should parse");
         assert_eq!(module.items.len(), 2);
