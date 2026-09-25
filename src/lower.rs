@@ -25,6 +25,7 @@ pub fn lower_type_parameters(parameters: &[surface::ast::Ident]) -> Result<Vec<S
 
 pub fn lower_type(typ: &surface::ast::Type, scope: &[surface::ast::Ident]) -> Result<kernel::Type> {
     match typ {
+        surface::ast::Type::Equiv(equiv) => lower_type_equiv(equiv, scope),
         surface::ast::Type::Lambda(lambda) => lower_type_lambda(lambda, scope),
         surface::ast::Type::Or(or) => lower_type_or(or, scope),
         surface::ast::Type::And(and) => lower_type_and(and, scope),
@@ -33,6 +34,24 @@ pub fn lower_type(typ: &surface::ast::Type, scope: &[surface::ast::Ident]) -> Re
         surface::ast::Type::False(f) => lower_type_false(f, scope),
         surface::ast::Type::Atom(atom) => lower_type_atom(atom, scope),
     }
+}
+
+fn lower_type_equiv(
+    equiv: &surface::ast::Equiv,
+    scope: &[surface::ast::Ident],
+) -> Result<kernel::Type> {
+    let left_type = Box::new(lower_type(&equiv.left, scope)?);
+    let right_type = Box::new(lower_type(&equiv.right, scope)?);
+    Ok(kernel::Type::Pair {
+        left_type: Box::new(kernel::Type::Lambda {
+            argument_type: left_type.clone(),
+            result_type: right_type.clone(),
+        }),
+        right_type: Box::new(kernel::Type::Lambda {
+            argument_type: right_type,
+            result_type: left_type,
+        })
+    })
 }
 
 fn lower_type_lambda(

@@ -53,6 +53,13 @@ theorem triple_neg_simp A : not not not A -> not A :=
 
 axiom excluded_middle A : A or not A.
 
-theorem double_neg' A : not not (A or not A) :=
-    fun (h : not (A or not A)) =>
-        h (excluded_middle [A]).
+theorem double_neg' A : not not A -> A :=
+    fun (h : not not A) => case excluded_middle [A] of
+        | inl x => x
+        | inr x => absurd [A] (h x).
+
+theorem equiv_is_reflexive A : A <-> A :=
+    (fun (h: A) => h, fun (h: A) => h).
+
+theorem equiv_is_commutative A B : (A <-> B) -> (B <-> A) :=
+    fun (h : A <-> B) => (snd h, fst h).

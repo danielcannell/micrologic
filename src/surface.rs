@@ -5,15 +5,16 @@
 // axiom   := "axiom" IDENT IDENT* ':' type '.'
 // theorem := "theorem" IDENT IDENT* ':' type ':=' term '.'
 //
-// type       := type_or ("->" type)?
-// type_or    := type_and ("or" type_or)?
-// type_and   := type_not ("and" type_and)?
-// type_not   := "not" type_not | type_atom
-// type_atom  := type_paren | type_true | type_false | type_ident
-// type_paren := "(" type ")"
-// type_true  := "True"
-// type_false := "False"
-// type_ident := IDENT
+// type        := type_lambda ("<->" type)?
+// type_lambda := type_or ("->" type)?
+// type_or     := type_and ("or" type_or)?
+// type_and    := type_not ("and" type_and)?
+// type_not    := "not" type_not | type_atom
+// type_atom   := type_paren | type_true | type_false | type_ident
+// type_paren  := "(" type ")"
+// type_true   := "True"
+// type_false  := "False"
+// type_ident  := IDENT
 //
 // term         := term_fun | term_case | term_app
 // term_fun     := "fun" "(" IDENT ":" type ")" "=>" term
@@ -69,6 +70,7 @@ pub mod ast {
 
     #[derive(Debug, Clone)]
     pub enum Type {
+        Equiv(Equiv),
         Lambda(Lambda),
         Or(Or),
         And(And),
@@ -76,6 +78,14 @@ pub mod ast {
         True(True),
         False(False),
         Atom(Atom),
+    }
+
+    /// `left_type <-> right_type`
+    #[derive(Debug, Clone)]
+    pub struct Equiv {
+        pub span: Span,
+        pub left: Box<Type>,
+        pub right: Box<Type>,
     }
 
     /// `argument_type -> result_type`
@@ -265,14 +275,15 @@ pub enum TokenKind {
     RightBracket, // ']'
 
     // Punctuation
-    Dot,        // '.'
-    Bar,        // '|'
-    Comma,      // ','
-    Colon,      // ':'
-    ColonEqual, // ':='
-    Equal,      // '='
-    FatArrow,   // '=>'
-    Arrow,      // '->'
+    Dot,         // '.'
+    Bar,         // '|'
+    Comma,       // ','
+    Colon,       // ':'
+    ColonEqual,  // ':='
+    Equal,       // '='
+    FatArrow,    // '=>'
+    Arrow,       // '->'
+    DoubleArrow, // '<->'
 
     Ident,
 
@@ -360,6 +371,13 @@ impl<'source> Lexer<'source> {
                         TokenKind::FatArrow
                     } else {
                         TokenKind::Equal
+                    }
+                }
+                '<' => {
+                    if self.accept('-') && self.accept('>') {
+                        TokenKind::DoubleArrow
+                    } else {
+                        TokenKind::InvalidToken
                     }
                 }
 
@@ -541,14 +559,30 @@ impl<'source> Parser<'source> {
         })
     }
 
-    // type := type_or ("->" type)?
+    // type := type_lambda ("<-> type)?
+    fn parse_type(&mut self) -> Result<ast::Type> {
+        let start = self.current.span;
+        let left = self.parse_type_lambda()?;
+        if self.accept_token(TokenKind::DoubleArrow) {
+            let right = self.parse_type()?;
+            Ok(ast::Type::Equiv(ast::Equiv {
+                span: self.span_from(start),
+                left: Box::new(left),
+                right: Box::new(right),
+            }))
+        } else {
+            Ok(left)
+        }
+    }
+
+    // type_lambda := type_or ("->" type_lambda)?
     //
     // "->" is right-associative, so we recurse on the right.
-    fn parse_type(&mut self) -> Result<ast::Type> {
+    fn parse_type_lambda(&mut self) -> Result<ast::Type> {
         let start = self.current.span;
         let left = self.parse_type_or()?;
         if self.accept_token(TokenKind::Arrow) {
-            let right = self.parse_type()?;
+            let right = self.parse_type_lambda()?;
             Ok(ast::Type::Lambda(ast::Lambda {
                 span: self.span_from(start),
                 argument_type: Box::new(left),
@@ -963,6 +997,7 @@ fn describe(kind: TokenKind) -> &'static str {
         TokenKind::Equal => "`=`",
         TokenKind::FatArrow => "`=>`",
         TokenKind::Arrow => "`->`",
+        TokenKind::DoubleArrow => "`<->`",
         TokenKind::Ident => "an identifier",
         TokenKind::InvalidToken => "an invalid token",
         TokenKind::Eof => "end of input",
@@ -977,6 +1012,11 @@ mod tests {
     // on structure (precedence and associativity) without depending on spans.
     fn show_type(typ: &ast::Type) -> String {
         match typ {
+            ast::Type::Equiv(e) => format!(
+                "(equiv {} {})",
+                show_type(&e.left),
+                show_type(&e.right)
+            ),
             ast::Type::Lambda(l) => {
                 format!(
                     "(-> {} {})",
@@ -1192,7 +1232,7 @@ mod tests {
             fst snd
             absurd trustme
             ()[]
-            .|,: := = => ->
+            .|,: := = => -> <->
             foo_bar_1'
         "#;
 
@@ -1225,6 +1265,7 @@ mod tests {
             (TokenKind::Equal, "="),
             (TokenKind::FatArrow, "=>"),
             (TokenKind::Arrow, "->"),
+            (TokenKind::DoubleArrow, "<->"),
             (TokenKind::Ident, "foo_bar_1'"),
             (TokenKind::Eof, ""),
             (TokenKind::Eof, ""),
