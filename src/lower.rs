@@ -92,21 +92,19 @@ fn lower_type_atom(
     scope: &[surface::ast::Ident],
 ) -> Result<kernel::Type> {
     let name = atom.name.text.clone();
-
-    let mut found = false;
-    for ident in scope {
-        if ident.text == name {
-            found = true;
-            break;
-        }
-    }
+    let found = scope.iter().any(|ident| ident.text == name);
 
     if !found {
+        let mut diag = Diagnostic::error(format!("unbound proposition {}", name), atom.span);
+
         let in_scope: Vec<&str> = scope.iter().map(|ident| ident.text.as_str()).collect();
-        return Err(
-            Diagnostic::error(format!("unbound proposition {}", name), atom.span)
-                .with_note(format!("propositions in scope: {}", in_scope.join(", "))),
-        );
+        if in_scope.is_empty() {
+            diag = diag.with_note("no bound propositions");
+        } else {
+            diag = diag.with_note(format!("bound propositions: {}", in_scope.join(", ")));
+        }
+        diag = diag.with_note(format!("try adding {} as a type parameter", name));
+        return Err(diag);
     }
 
     Ok(kernel::Type::Atom { name })
