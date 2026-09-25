@@ -384,7 +384,13 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
 
             // Check the correct number of type arguments have been provided.
             if type_arguments.len() != scheme.params.len() {
-                return Err("Incorrect number of type parameters".to_string());
+                return Err(format!(
+                    "{} expects {} type argument{} but got {}",
+                    name,
+                    scheme.params.len(),
+                    if scheme.params.len() != 1 { "s" } else { "" },
+                    type_arguments.len()
+                ));
             }
 
             // Substitute the type parameters with the provided types

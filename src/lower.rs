@@ -11,7 +11,7 @@ pub fn lower_type_parameters(parameters: &[surface::ast::Ident]) -> Result<Vec<S
         // If the seen set already contained the parameter
         if let Some(prev_span) = seen.insert(&param.text, param.span) {
             return Err(Diagnostic::error(
-                format!("duplicate proposition {}", param.text),
+                format!("duplicate parameter {}", param.text),
                 param.span,
             )
             .with_label(prev_span, format!("previous declaration of {}", param.text)));
@@ -95,13 +95,13 @@ fn lower_type_atom(
     let found = scope.iter().any(|ident| ident.text == name);
 
     if !found {
-        let mut diag = Diagnostic::error(format!("unbound proposition {}", name), atom.span);
+        let mut diag = Diagnostic::error(format!("unbound parameter {}", name), atom.span);
 
         let in_scope: Vec<&str> = scope.iter().map(|ident| ident.text.as_str()).collect();
         if in_scope.is_empty() {
-            diag = diag.with_note("no bound propositions");
+            diag = diag.with_note("no bound parameters");
         } else {
-            diag = diag.with_note(format!("bound propositions: {}", in_scope.join(", ")));
+            diag = diag.with_note(format!("bound parameters: {}", in_scope.join(", ")));
         }
         diag = diag.with_note(format!("try adding {} as a type parameter", name));
         return Err(diag);
