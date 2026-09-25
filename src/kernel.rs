@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::rc::Rc;
 
@@ -42,6 +43,67 @@ pub enum Type {
 }
 
 impl Type {
+    fn substitute(&self, arguments: &HashMap<&str, &Type>) -> Type {
+        match self {
+            Type::Atom { name } => match arguments.get(name.as_str()) {
+                Some(&typ) => typ.clone(),
+                None => Type::Atom { name: name.clone() },
+            },
+            Type::Lambda {
+                argument_type,
+                result_type,
+            } => Type::Lambda {
+                argument_type: Box::new(argument_type.substitute(arguments)),
+                result_type: Box::new(result_type.substitute(arguments)),
+            },
+            Type::Pair {
+                left_type,
+                right_type,
+            } => Type::Pair {
+                left_type: Box::new(left_type.substitute(arguments)),
+                right_type: Box::new(right_type.substitute(arguments)),
+            },
+            Type::Either {
+                left_type,
+                right_type,
+            } => Type::Either {
+                left_type: Box::new(left_type.substitute(arguments)),
+                right_type: Box::new(right_type.substitute(arguments)),
+            },
+            Type::False => Type::False,
+        }
+    }
+
+    fn free_atoms(&self, out: &mut HashSet<String>) {
+        match self {
+            Type::Atom { name } => {
+                out.insert(name.clone());
+            }
+            Type::Lambda {
+                argument_type,
+                result_type,
+            } => {
+                argument_type.free_atoms(out);
+                result_type.free_atoms(out);
+            }
+            Type::Pair {
+                left_type,
+                right_type,
+            } => {
+                left_type.free_atoms(out);
+                right_type.free_atoms(out);
+            }
+            Type::Either {
+                left_type,
+                right_type,
+            } => {
+                left_type.free_atoms(out);
+                right_type.free_atoms(out);
+            }
+            Type::False => {}
+        }
+    }
+
     fn fmt_at_prec(&self, f: &mut std::fmt::Formatter<'_>, prec: u8) -> std::fmt::Result {
         let this_prec = match self {
             Type::Atom { .. } => 2,
@@ -105,12 +167,56 @@ impl Display for Type {
 }
 
 #[derive(Debug, Clone)]
+pub struct Scheme {
+    // Bound parameter names.
+    params: Vec<String>,
+
+    // Type, where atoms refer to names bound in `params`.
+    typ: Type,
+}
+
+impl Scheme {
+    pub fn new(params: Vec<String>, typ: Type) -> Self {
+        // Get the set of type parameters
+        let params_set: HashSet<String> = params.iter().cloned().collect();
+
+        // Check that we had no duplicates in the list -- the lowering should guarantee this
+        if params_set.len() != params.len() {
+            panic!("should never have duplicate type parameters in scheme");
+        }
+
+        // Get the set of free atoms in the type
+        let mut free_atoms_set = HashSet::new();
+        typ.free_atoms(&mut free_atoms_set);
+
+        // All free atoms in the type must be bound in the scheme -- the lowering should guarantee
+        // this
+        if !free_atoms_set.is_subset(&params_set) {
+            panic!("should never have unbound atoms in scheme type");
+        }
+
+        Self { params, typ }
+    }
+
+    fn new_monomorphic(typ: Type) -> Self {
+        Self {
+            params: Vec::new(),
+            typ,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 #[allow(unused)]
 pub enum Term {
-    /// `name`
+    /// `name [A] [B]`
     ///
-    /// Corresponds to a hypothesis or previously proved theorem
-    Var { name: String },
+    /// Corresponds to a hypothesis or previously proved theorem. Any type parameters are explicitly
+    /// annotated to avoid the need for bidirectional type checking for now.
+    Var {
+        name: String,
+        type_arguments: Vec<Type>,
+    },
 
     /// `fun (x: A) = t`
     ///
@@ -201,33 +307,33 @@ enum ContextInner {
     Empty,
     Binding {
         name: String,
-        typ: Type,
+        scheme: Scheme,
         trust: Trust,
         parent: Rc<ContextInner>,
     },
 }
 
 impl ContextInner {
-    fn bind(self: Rc<Self>, name: String, typ: Type, trust: Trust) -> Rc<Self> {
+    fn bind(self: Rc<Self>, name: String, scheme: Scheme, trust: Trust) -> Rc<Self> {
         Rc::new(ContextInner::Binding {
             name,
-            typ,
+            scheme,
             trust,
             parent: self,
         })
     }
 
-    fn lookup(&self, n: &str) -> Option<(Type, Trust)> {
+    fn lookup(&self, n: &str) -> Option<(&Scheme, Trust)> {
         match self {
             ContextInner::Empty => None,
             ContextInner::Binding {
                 name,
-                typ,
+                scheme,
                 trust,
                 parent,
             } => {
                 if name == n {
-                    Some((typ.clone(), *trust))
+                    Some((scheme, *trust))
                 } else {
                     parent.lookup(n)
                 }
@@ -244,15 +350,15 @@ impl Context {
         Context(Rc::new(ContextInner::Empty))
     }
 
-    pub fn bind(&self, name: String, typ: Type) -> Self {
-        self.bind_with_trust(name, typ, Trust::Proved)
+    pub fn bind(&self, name: String, scheme: Scheme) -> Self {
+        self.bind_with_trust(name, scheme, Trust::Proved)
     }
 
-    pub fn bind_with_trust(&self, name: String, typ: Type, trust: Trust) -> Self {
-        Context(self.0.clone().bind(name, typ, trust))
+    pub fn bind_with_trust(&self, name: String, scheme: Scheme, trust: Trust) -> Self {
+        Context(self.0.clone().bind(name, scheme, trust))
     }
 
-    pub fn lookup(&self, name: &str) -> Option<(Type, Trust)> {
+    pub fn lookup(&self, name: &str) -> Option<(&Scheme, Trust)> {
         self.0.lookup(name)
     }
 }
@@ -265,13 +371,32 @@ impl Default for Context {
 
 fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> {
     match term {
-        Term::Var { name } => {
-            let (typ, binding_trust) = ctx
+        Term::Var {
+            name,
+            type_arguments,
+        } => {
+            let (scheme, binding_trust) = ctx
                 .lookup(name)
                 .ok_or_else(|| format!("Unknown variable {}", name))?;
+
             // Referring to an admitted theorem taints this proof too.
             trust.admit(binding_trust);
-            Ok(typ)
+
+            // Check the correct number of type arguments have been provided.
+            if type_arguments.len() != scheme.params.len() {
+                return Err("Incorrect number of type parameters".to_string());
+            }
+
+            // Substitute the type parameters with the provided types
+            let type_arguments: HashMap<&str, &Type> = scheme
+                .params
+                .iter()
+                .map(|name| name.as_str())
+                .zip(type_arguments.iter())
+                .collect();
+            let substituted_type = scheme.typ.substitute(&type_arguments);
+
+            Ok(substituted_type)
         }
 
         Term::Lambda {
@@ -280,7 +405,10 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
             body,
         } => {
             let result_type_inferred = infer(
-                &ctx.bind(argument.clone(), argument_type.clone()),
+                &ctx.bind(
+                    argument.clone(),
+                    Scheme::new_monomorphic(argument_type.clone()),
+                ),
                 body,
                 trust,
             )?;
@@ -376,11 +504,14 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
                 }
             };
 
-            let left_body_type_inferred =
-                infer(&ctx.bind(left_name.clone(), *left_type), left_body, trust)?;
+            let left_body_type_inferred = infer(
+                &ctx.bind(left_name.clone(), Scheme::new_monomorphic(*left_type)),
+                left_body,
+                trust,
+            )?;
 
             let right_body_type_inferred = infer(
-                &ctx.bind(right_name.clone(), *right_type),
+                &ctx.bind(right_name.clone(), Scheme::new_monomorphic(*right_type)),
                 right_body,
                 trust,
             )?;
@@ -414,13 +545,13 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
     }
 }
 
-pub fn check(ctx: &Context, term: &Term, term_type: Type) -> Result<Trust, String> {
+pub fn check(ctx: &Context, term: &Term, scheme: &Scheme) -> Result<Trust, String> {
     let mut trust = Trust::Proved;
     let term_type_inferred = infer(ctx, term, &mut trust)?;
-    if term_type_inferred != term_type {
+    if term_type_inferred != scheme.typ {
         return Err(format!(
             "Incorrect type: expected {} but got {}",
-            term_type, term_type_inferred
+            scheme.typ, term_type_inferred
         ));
     }
     Ok(trust)

@@ -2,8 +2,8 @@
 //
 // module  := item*
 // item    := axiom | theorem
-// axiom   := "axiom" IDENT ':' type '.'
-// theorem := "theorem" IDENT ':' type ':=' term '.'
+// axiom   := "axiom" IDENT IDENT* ':' type '.'
+// theorem := "theorem" IDENT IDENT* ':' type ':=' term '.'
 //
 // type       := type_or ("->" type)?
 // type_or    := type_and ("or" type_or)?
@@ -28,9 +28,10 @@
 // term_inr     := "inr" "[" type "]" term_atom
 // term_absurd  := "absurd" "[" type "]" term_atom
 // term_trustme := "trustme" "[" type "]"
-// term_var     := IDENT
+// term_var     := IDENT ( "[" type "]" )*
 
 use crate::diagnostics::{Diagnostic, Result, Span};
+use crate::surface::ast::Term;
 use std::str::CharIndices;
 
 pub mod ast {
@@ -53,6 +54,7 @@ pub mod ast {
     pub struct Axiom {
         pub span: Span,
         pub name: Ident,
+        pub parameters: Vec<Ident>,
         pub typ: Type,
     }
 
@@ -61,6 +63,7 @@ pub mod ast {
     pub struct Theorem {
         pub span: Span,
         pub name: Ident,
+        pub parameters: Vec<Ident>,
         pub typ: Type,
         pub body: Term,
     }
@@ -144,6 +147,7 @@ pub mod ast {
     pub struct Var {
         pub span: Span,
         pub name: Ident,
+        pub type_arguments: Vec<Type>,
     }
 
     /// `fun (argument : argument_type) => body`
@@ -495,26 +499,35 @@ impl<'source> Parser<'source> {
         }
     }
 
-    // axiom := "axiom" IDENT ':' type '.'
+    // axiom := "axiom" IDENT IDENT* ':' type '.'
     fn parse_axiom(&mut self) -> Result<ast::Axiom> {
         let start = self.current.span;
         self.expect_token(TokenKind::Axiom)?;
         let name = self.parse_ident()?;
+        let mut parameters = Vec::new();
+        while self.check_token(TokenKind::Ident) {
+            parameters.push(self.parse_ident()?);
+        }
         self.expect_token(TokenKind::Colon)?;
         let typ = self.parse_type()?;
         self.expect_token(TokenKind::Dot)?;
         Ok(ast::Axiom {
             span: self.span_from(start),
             name,
+            parameters,
             typ,
         })
     }
 
-    // theorem := "theorem" IDENT ':' type ':=' term '.'
+    // theorem := "theorem" IDENT IDENT* ':' type ':=' term '.'
     fn parse_theorem(&mut self) -> Result<ast::Theorem> {
         let start = self.current.span;
         self.expect_token(TokenKind::Theorem)?;
         let name = self.parse_ident()?;
+        let mut parameters = Vec::new();
+        while self.check_token(TokenKind::Ident) {
+            parameters.push(self.parse_ident()?);
+        }
         self.expect_token(TokenKind::Colon)?;
         let typ = self.parse_type()?;
         self.expect_token(TokenKind::ColonEqual)?;
@@ -523,6 +536,7 @@ impl<'source> Parser<'source> {
         Ok(ast::Theorem {
             span: self.span_from(start),
             name,
+            parameters,
             typ,
             body,
         })
@@ -709,81 +723,17 @@ impl<'source> Parser<'source> {
         )
     }
 
-    // term_atom := term_paren | term_pair | term_fst | term_snd | term_inl
-    //            | term_inr | term_absurd | term_trustme | term_var
+    // term_atom := term_paren | term_pair | term_fst | term_snd | term_inl | term_inr | term_absurd | term_trustme | term_var
     fn parse_term_atom(&mut self) -> Result<ast::Term> {
-        let start = self.current.span;
         match self.peek_token() {
             TokenKind::LeftParen => self.parse_term_paren_or_pair(),
-            TokenKind::Fst => {
-                self.expect_token(TokenKind::Fst)?;
-                let pair = self.parse_term_atom()?;
-                Ok(ast::Term::Fst(ast::Fst {
-                    span: self.span_from(start),
-                    pair: Box::new(pair),
-                }))
-            }
-            TokenKind::Snd => {
-                self.expect_token(TokenKind::Snd)?;
-                let pair = self.parse_term_atom()?;
-                Ok(ast::Term::Snd(ast::Snd {
-                    span: self.span_from(start),
-                    pair: Box::new(pair),
-                }))
-            }
-            TokenKind::Inl => {
-                self.expect_token(TokenKind::Inl)?;
-                self.expect_token(TokenKind::LeftBracket)?;
-                let right_type = self.parse_type()?;
-                self.expect_token(TokenKind::RightBracket)?;
-                let left = self.parse_term_atom()?;
-                Ok(ast::Term::Inl(ast::Inl {
-                    span: self.span_from(start),
-                    right_type,
-                    left: Box::new(left),
-                }))
-            }
-            TokenKind::Inr => {
-                self.expect_token(TokenKind::Inr)?;
-                self.expect_token(TokenKind::LeftBracket)?;
-                let left_type = self.parse_type()?;
-                self.expect_token(TokenKind::RightBracket)?;
-                let right = self.parse_term_atom()?;
-                Ok(ast::Term::Inr(ast::Inr {
-                    span: self.span_from(start),
-                    left_type,
-                    right: Box::new(right),
-                }))
-            }
-            TokenKind::Absurd => {
-                self.expect_token(TokenKind::Absurd)?;
-                self.expect_token(TokenKind::LeftBracket)?;
-                let goal_type = self.parse_type()?;
-                self.expect_token(TokenKind::RightBracket)?;
-                let body = self.parse_term_atom()?;
-                Ok(ast::Term::Absurd(ast::Absurd {
-                    span: self.span_from(start),
-                    goal_type,
-                    body: Box::new(body),
-                }))
-            }
-            TokenKind::TrustMe => {
-                self.expect_token(TokenKind::TrustMe)?;
-                self.expect_token(TokenKind::LeftBracket)?;
-                let goal_type = self.parse_type()?;
-                self.expect_token(TokenKind::RightBracket)?;
-                Ok(ast::Term::TrustMe(ast::TrustMe {
-                    span: self.span_from(start),
-                    goal_type,
-                }))
-            }
-            TokenKind::Ident => {
-                let name = self.parse_ident()?;
-                Ok(ast::Term::Var(ast::Var {
-                    span: self.span_from(start),
-                    name,
-                }))
-            }
+            TokenKind::Fst => self.parse_fst(),
+            TokenKind::Snd => self.parse_snd(),
+            TokenKind::Inl => self.parse_inl(),
+            TokenKind::Inr => self.parse_inr(),
+            TokenKind::Absurd => self.parse_absurd(),
+            TokenKind::TrustMe => self.parse_trustme(),
+            TokenKind::Ident => self.parse_var(),
             _ => self.unexpected("a term"),
         }
     }
@@ -821,6 +771,102 @@ impl<'source> Parser<'source> {
             });
         }
         Ok(right)
+    }
+
+    // term_fst := "fst" term_atom
+    fn parse_fst(&mut self) -> Result<Term> {
+        let start = self.current.span;
+        self.expect_token(TokenKind::Fst)?;
+        let pair = self.parse_term_atom()?;
+        Ok(ast::Term::Fst(ast::Fst {
+            span: self.span_from(start),
+            pair: Box::new(pair),
+        }))
+    }
+
+    // term_snd := "snd" term_atom
+    fn parse_snd(&mut self) -> Result<Term> {
+        let start = self.current.span;
+        self.expect_token(TokenKind::Snd)?;
+        let pair = self.parse_term_atom()?;
+        Ok(ast::Term::Snd(ast::Snd {
+            span: self.span_from(start),
+            pair: Box::new(pair),
+        }))
+    }
+
+    // term_inl := "inl" "[" type "]" term_atom
+    fn parse_inl(&mut self) -> Result<Term> {
+        let start = self.current.span;
+        self.expect_token(TokenKind::Inl)?;
+        self.expect_token(TokenKind::LeftBracket)?;
+        let right_type = self.parse_type()?;
+        self.expect_token(TokenKind::RightBracket)?;
+        let left = self.parse_term_atom()?;
+        Ok(ast::Term::Inl(ast::Inl {
+            span: self.span_from(start),
+            right_type,
+            left: Box::new(left),
+        }))
+    }
+
+    // term_inr := "inr" "[" type "]" term_atom
+    fn parse_inr(&mut self) -> Result<Term> {
+        let start = self.current.span;
+        self.expect_token(TokenKind::Inr)?;
+        self.expect_token(TokenKind::LeftBracket)?;
+        let left_type = self.parse_type()?;
+        self.expect_token(TokenKind::RightBracket)?;
+        let right = self.parse_term_atom()?;
+        Ok(ast::Term::Inr(ast::Inr {
+            span: self.span_from(start),
+            left_type,
+            right: Box::new(right),
+        }))
+    }
+
+    // term_absurd := "absurd" "[" type "]" term_atom
+    fn parse_absurd(&mut self) -> Result<Term> {
+        let start = self.current.span;
+        self.expect_token(TokenKind::Absurd)?;
+        self.expect_token(TokenKind::LeftBracket)?;
+        let goal_type = self.parse_type()?;
+        self.expect_token(TokenKind::RightBracket)?;
+        let body = self.parse_term_atom()?;
+        Ok(ast::Term::Absurd(ast::Absurd {
+            span: self.span_from(start),
+            goal_type,
+            body: Box::new(body),
+        }))
+    }
+
+    // term_trustme := "trustme" "[" type "]"
+    fn parse_trustme(&mut self) -> Result<Term> {
+        let start = self.current.span;
+        self.expect_token(TokenKind::TrustMe)?;
+        self.expect_token(TokenKind::LeftBracket)?;
+        let goal_type = self.parse_type()?;
+        self.expect_token(TokenKind::RightBracket)?;
+        Ok(ast::Term::TrustMe(ast::TrustMe {
+            span: self.span_from(start),
+            goal_type,
+        }))
+    }
+
+    // term_var := IDENT ( "[" type "]" )*
+    fn parse_var(&mut self) -> Result<Term> {
+        let start = self.current.span;
+        let name = self.parse_ident()?;
+        let mut type_arguments = Vec::new();
+        while self.accept_token(TokenKind::LeftBracket) {
+            type_arguments.push(self.parse_type()?);
+            self.expect_token(TokenKind::RightBracket)?;
+        }
+        Ok(ast::Term::Var(ast::Var {
+            span: self.span_from(start),
+            name,
+            type_arguments,
+        }))
     }
 
     fn parse_ident(&mut self) -> Result<ast::Ident> {
