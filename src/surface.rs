@@ -31,7 +31,6 @@
 // term_var     := IDENT ( "[" type "]" )*
 
 use crate::diagnostics::{Diagnostic, Result, Span};
-use crate::surface::ast::Term;
 use std::str::CharIndices;
 
 pub mod ast {
@@ -774,7 +773,7 @@ impl<'source> Parser<'source> {
     }
 
     // term_fst := "fst" term_atom
-    fn parse_fst(&mut self) -> Result<Term> {
+    fn parse_fst(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         self.expect_token(TokenKind::Fst)?;
         let pair = self.parse_term_atom()?;
@@ -785,7 +784,7 @@ impl<'source> Parser<'source> {
     }
 
     // term_snd := "snd" term_atom
-    fn parse_snd(&mut self) -> Result<Term> {
+    fn parse_snd(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         self.expect_token(TokenKind::Snd)?;
         let pair = self.parse_term_atom()?;
@@ -796,7 +795,7 @@ impl<'source> Parser<'source> {
     }
 
     // term_inl := "inl" "[" type "]" term_atom
-    fn parse_inl(&mut self) -> Result<Term> {
+    fn parse_inl(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         self.expect_token(TokenKind::Inl)?;
         self.expect_token(TokenKind::LeftBracket)?;
@@ -811,7 +810,7 @@ impl<'source> Parser<'source> {
     }
 
     // term_inr := "inr" "[" type "]" term_atom
-    fn parse_inr(&mut self) -> Result<Term> {
+    fn parse_inr(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         self.expect_token(TokenKind::Inr)?;
         self.expect_token(TokenKind::LeftBracket)?;
@@ -826,7 +825,7 @@ impl<'source> Parser<'source> {
     }
 
     // term_absurd := "absurd" "[" type "]" term_atom
-    fn parse_absurd(&mut self) -> Result<Term> {
+    fn parse_absurd(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         self.expect_token(TokenKind::Absurd)?;
         self.expect_token(TokenKind::LeftBracket)?;
@@ -841,7 +840,7 @@ impl<'source> Parser<'source> {
     }
 
     // term_trustme := "trustme" "[" type "]"
-    fn parse_trustme(&mut self) -> Result<Term> {
+    fn parse_trustme(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         self.expect_token(TokenKind::TrustMe)?;
         self.expect_token(TokenKind::LeftBracket)?;
@@ -854,7 +853,7 @@ impl<'source> Parser<'source> {
     }
 
     // term_var := IDENT ( "[" type "]" )*
-    fn parse_var(&mut self) -> Result<Term> {
+    fn parse_var(&mut self) -> Result<ast::Term> {
         let start = self.current.span;
         let name = self.parse_ident()?;
         let mut type_arguments = Vec::new();
