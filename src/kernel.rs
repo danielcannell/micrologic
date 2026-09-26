@@ -204,6 +204,29 @@ impl Scheme {
             typ,
         }
     }
+
+    pub fn instantiate(&self, type_arguments: &[Type]) -> Result<Type, String> {
+        // Check the correct number of type arguments have been provided.
+        if type_arguments.len() != self.params.len() {
+            return Err(format!(
+                "expected {} type argument{} but got {}",
+                self.params.len(),
+                if self.params.len() != 1 { "s" } else { "" },
+                type_arguments.len()
+            ));
+        }
+
+        // Substitute the type parameters with the provided types
+        let type_arguments: HashMap<&str, &Type> = self
+            .params
+            .iter()
+            .map(|name| name.as_str())
+            .zip(type_arguments.iter())
+            .collect();
+        let substituted_type = self.typ.substitute(&type_arguments);
+
+        Ok(substituted_type)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -382,27 +405,8 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
             // Referring to an admitted theorem taints this proof too.
             trust.admit(binding_trust);
 
-            // Check the correct number of type arguments have been provided.
-            if type_arguments.len() != scheme.params.len() {
-                return Err(format!(
-                    "{} expects {} type argument{} but got {}",
-                    name,
-                    scheme.params.len(),
-                    if scheme.params.len() != 1 { "s" } else { "" },
-                    type_arguments.len()
-                ));
-            }
-
-            // Substitute the type parameters with the provided types
-            let type_arguments: HashMap<&str, &Type> = scheme
-                .params
-                .iter()
-                .map(|name| name.as_str())
-                .zip(type_arguments.iter())
-                .collect();
-            let substituted_type = scheme.typ.substitute(&type_arguments);
-
-            Ok(substituted_type)
+            // Substitute type arguments for type parameters
+            scheme.instantiate(type_arguments)
         }
 
         Term::Lambda {

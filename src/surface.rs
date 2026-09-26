@@ -1,15 +1,17 @@
 // Surface grammar:
 //
-// module  := item*
-// item    := axiom | theorem
-// axiom   := "axiom" IDENT IDENT* ':' type '.'
-// theorem := "theorem" IDENT IDENT* ':' type ':=' term '.'
+// module      := item*
+// item        := axiom | theorem | proposition
+// axiom       := "axiom" IDENT IDENT* ':' type '.'
+// theorem     := "theorem" IDENT IDENT* ':' type ':=' term '.'
+// proposition := "proposition" IDENT IDENT* ':=' type '.'
 //
 // type        := type_lambda ("<->" type)?
 // type_lambda := type_or ("->" type)?
 // type_or     := type_and ("or" type_or)?
 // type_and    := type_not ("and" type_and)?
-// type_not    := "not" type_not | type_atom
+// type_not    := "not" type_not | type_app
+// type_app    := IDENT type_atom+ | type_atom
 // type_atom   := type_paren | type_true | type_false | type_ident
 // type_paren  := "(" type ")"
 // type_true   := "True"
@@ -47,9 +49,10 @@ pub mod ast {
     pub enum Item {
         Axiom(Axiom),
         Theorem(Theorem),
+        Proposition(Proposition),
     }
 
-    /// `axiom name : type .`
+    /// `axiom name params : type .`
     #[derive(Debug, Clone)]
     pub struct Axiom {
         pub span: Span,
@@ -58,7 +61,7 @@ pub mod ast {
         pub typ: Type,
     }
 
-    /// `theorem name : type := body .`
+    /// `theorem name params : type := body .`
     #[derive(Debug, Clone)]
     pub struct Theorem {
         pub span: Span,
@@ -68,6 +71,15 @@ pub mod ast {
         pub body: Term,
     }
 
+    /// `proposition name params : type .`
+    #[derive(Debug, Clone)]
+    pub struct Proposition {
+        pub span: Span,
+        pub name: Ident,
+        pub parameters: Vec<Ident>,
+        pub typ: Type,
+    }
+
     #[derive(Debug, Clone)]
     pub enum Type {
         Equiv(Equiv),
@@ -75,6 +87,7 @@ pub mod ast {
         Or(Or),
         And(And),
         Not(Not),
+        App(TypeApp),
         True(True),
         False(False),
         Atom(Atom),
@@ -117,6 +130,13 @@ pub mod ast {
     pub struct Not {
         pub span: Span,
         pub operand: Box<Type>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct TypeApp {
+        pub span: Span,
+        pub name: Ident,
+        pub arguments: Vec<Type>,
     }
 
     #[derive(Debug, Clone)]
@@ -251,22 +271,23 @@ pub mod ast {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     // Keywords
-    Axiom,   // "axiom
-    Theorem, // "theorem"
-    Or,      // "or"
-    And,     // "and"
-    Not,     // "not"
-    True,    // "True
-    False,   // "False
-    Fun,     // "fun"
-    Case,    // "case"
-    Of,      // "of"
-    Inl,     // "inl"
-    Inr,     // "inr"
-    Fst,     // "fst"
-    Snd,     // "snd"
-    Absurd,  // "absurd"
-    TrustMe, // "trustme"
+    Axiom,       // "axiom
+    Theorem,     // "theorem"
+    Proposition, // "proposition"
+    Or,          // "or"
+    And,         // "and"
+    Not,         // "not"
+    True,        // "True
+    False,       // "False
+    Fun,         // "fun"
+    Case,        // "case"
+    Of,          // "of"
+    Inl,         // "inl"
+    Inr,         // "inr"
+    Fst,         // "fst"
+    Snd,         // "snd"
+    Absurd,      // "absurd"
+    TrustMe,     // "trustme"
 
     // Delimiters
     LeftParen,    // '('
@@ -391,6 +412,7 @@ impl<'source> Lexer<'source> {
                     match text {
                         "axiom" => TokenKind::Axiom,
                         "theorem" => TokenKind::Theorem,
+                        "proposition" => TokenKind::Proposition,
                         "or" => TokenKind::Or,
                         "and" => TokenKind::And,
                         "not" => TokenKind::Not,
@@ -512,7 +534,8 @@ impl<'source> Parser<'source> {
         match self.peek_token() {
             TokenKind::Axiom => Ok(ast::Item::Axiom(self.parse_axiom()?)),
             TokenKind::Theorem => Ok(ast::Item::Theorem(self.parse_theorem()?)),
-            _ => self.unexpected("`axiom` or `theorem`"),
+            TokenKind::Proposition => Ok(ast::Item::Proposition(self.parse_proposition()?)),
+            _ => self.unexpected("`axiom`, `theorem` or `proposition`"),
         }
     }
 
@@ -556,6 +579,26 @@ impl<'source> Parser<'source> {
             parameters,
             typ,
             body,
+        })
+    }
+
+    // proposition := "proposition" IDENT IDENT* ':' type '.'
+    fn parse_proposition(&mut self) -> Result<ast::Proposition> {
+        let start = self.current.span;
+        self.expect_token(TokenKind::Proposition)?;
+        let name = self.parse_ident()?;
+        let mut parameters = Vec::new();
+        while self.check_token(TokenKind::Ident) {
+            parameters.push(self.parse_ident()?);
+        }
+        self.expect_token(TokenKind::ColonEqual)?;
+        let typ = self.parse_type()?;
+        self.expect_token(TokenKind::Dot)?;
+        Ok(ast::Proposition {
+            span: self.span_from(start),
+            name,
+            parameters,
+            typ,
         })
     }
 
@@ -625,7 +668,7 @@ impl<'source> Parser<'source> {
         }
     }
 
-    // type_not := "not" type_not | type_atom
+    // type_not := "not" type_not | type_app
     fn parse_type_not(&mut self) -> Result<ast::Type> {
         let start = self.current.span;
         if self.accept_token(TokenKind::Not) {
@@ -635,8 +678,43 @@ impl<'source> Parser<'source> {
                 operand: Box::new(operand),
             }))
         } else {
+            self.parse_type_app()
+        }
+    }
+
+    // type_app := IDENT type_atom+ | type_atom
+    fn parse_type_app(&mut self) -> Result<ast::Type> {
+        let start = self.current.span;
+        if self.check_token(TokenKind::Ident) {
+            let name = self.parse_ident()?;
+            let mut arguments = Vec::new();
+
+            while self.at_type_atom_start() {
+                arguments.push(self.parse_type_atom()?);
+            }
+
+            if arguments.is_empty() {
+                Ok(ast::Type::Atom(ast::Atom {
+                    span: self.span_from(start),
+                    name,
+                }))
+            } else {
+                Ok(ast::Type::App(ast::TypeApp {
+                    span: self.span_from(start),
+                    name,
+                    arguments,
+                }))
+            }
+        } else {
             self.parse_type_atom()
         }
+    }
+
+    fn at_type_atom_start(&self) -> bool {
+        matches!(
+            self.peek_token(),
+            TokenKind::LeftParen | TokenKind::True | TokenKind::False | TokenKind::Ident
+        )
     }
 
     // type_atom  := type_paren | type_true | type_false | type_ident
@@ -971,6 +1049,7 @@ fn describe(kind: TokenKind) -> &'static str {
     match kind {
         TokenKind::Axiom => "`axiom`",
         TokenKind::Theorem => "`theorem`",
+        TokenKind::Proposition => "`proposition`",
         TokenKind::Or => "`or`",
         TokenKind::And => "`and`",
         TokenKind::Not => "`not`",
@@ -1012,11 +1091,9 @@ mod tests {
     // on structure (precedence and associativity) without depending on spans.
     fn show_type(typ: &ast::Type) -> String {
         match typ {
-            ast::Type::Equiv(e) => format!(
-                "(equiv {} {})",
-                show_type(&e.left),
-                show_type(&e.right)
-            ),
+            ast::Type::Equiv(e) => {
+                format!("(equiv {} {})", show_type(&e.left), show_type(&e.right))
+            }
             ast::Type::Lambda(l) => {
                 format!(
                     "(-> {} {})",
@@ -1027,6 +1104,15 @@ mod tests {
             ast::Type::Or(o) => format!("(or {} {})", show_type(&o.left), show_type(&o.right)),
             ast::Type::And(a) => format!("(and {} {})", show_type(&a.left), show_type(&a.right)),
             ast::Type::Not(n) => format!("(not {})", show_type(&n.operand)),
+            ast::Type::App(a) => format!(
+                "(type_app {} {})",
+                a.name.text,
+                a.arguments
+                    .iter()
+                    .map(|arg| show_type(arg))
+                    .collect::<Vec<String>>()
+                    .join(" ")
+            ),
             ast::Type::True(_) => "True".to_string(),
             ast::Type::False(_) => "False".to_string(),
             ast::Type::Atom(a) => a.name.text.clone(),
@@ -1215,7 +1301,6 @@ mod tests {
 
     #[test]
     fn test_parse_errors() {
-        assert!(parse("theorem t : A B := x.").is_err()); // junk after type
         assert!(parse("axiom a A.").is_err()); // missing colon
         assert!(parse("theorem t : A := .").is_err()); // missing body
     }
@@ -1224,7 +1309,7 @@ mod tests {
     fn test_lex() {
         const EXAMPLES: &str = r#"
             -- A comment
-            axiom theorem
+            axiom theorem proposition
             or and not
             True False
             fun
@@ -1239,6 +1324,7 @@ mod tests {
         let expected_tokens = vec![
             (TokenKind::Axiom, "axiom"),
             (TokenKind::Theorem, "theorem"),
+            (TokenKind::Proposition, "proposition"),
             (TokenKind::Or, "or"),
             (TokenKind::And, "and"),
             (TokenKind::Not, "not"),
