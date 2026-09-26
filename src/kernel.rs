@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::rc::Rc;
 
+use crate::diagnostics::{Diagnostic, Result, Span};
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[allow(unused)]
 pub enum Type {
@@ -205,14 +207,17 @@ impl Scheme {
         }
     }
 
-    pub fn instantiate(&self, type_arguments: &[Type]) -> Result<Type, String> {
+    pub fn instantiate(&self, at: Span, type_arguments: &[Type]) -> Result<Type> {
         // Check the correct number of type arguments have been provided.
         if type_arguments.len() != self.params.len() {
-            return Err(format!(
-                "expected {} type argument{} but got {}",
-                self.params.len(),
-                if self.params.len() != 1 { "s" } else { "" },
-                type_arguments.len()
+            return Err(Diagnostic::error(
+                format!(
+                    "expected {} type argument{} but got {}",
+                    self.params.len(),
+                    if self.params.len() != 1 { "s" } else { "" },
+                    type_arguments.len()
+                ),
+                at,
             ));
         }
 
@@ -237,6 +242,7 @@ pub enum Term {
     /// Corresponds to a hypothesis or previously proved theorem. Any type parameters are explicitly
     /// annotated to avoid the need for bidirectional type checking for now.
     Var {
+        span: Span,
         name: String,
         type_arguments: Vec<Type>,
     },
@@ -245,6 +251,7 @@ pub enum Term {
     ///
     /// Corresponds to implication introduction
     Lambda {
+        span: Span,
         argument: String,
         argument_type: Type,
         body: Box<Term>,
@@ -254,6 +261,7 @@ pub enum Term {
     ///
     /// Corresponds to implication elimination (modus ponens)
     Application {
+        span: Span,
         function: Box<Term>,
         argument: Box<Term>,
     },
@@ -261,34 +269,47 @@ pub enum Term {
     /// `(t, u)`
     ///
     /// Corresponds to conjunction introduction
-    Pair { left: Box<Term>, right: Box<Term> },
+    Pair {
+        span: Span,
+        left: Box<Term>,
+        right: Box<Term>,
+    },
 
     /// `fst t`
     ///
     /// Corresponds to left conjunction elimination
-    Fst { pair: Box<Term> },
+    Fst { span: Span, pair: Box<Term> },
 
     /// `snd t`
     ///
     /// Corresponds to right conjunction elimination
-    Snd { pair: Box<Term> },
+    Snd { span: Span, pair: Box<Term> },
 
     /// `inl [R] t`
     ///
     /// Corresponds to left disjunction introduction. The right type is annotated to avoid the need
     /// for bidirectional inference for now.
-    Inl { right_type: Type, left: Box<Term> },
+    Inl {
+        span: Span,
+        right_type: Type,
+        left: Box<Term>,
+    },
 
     /// `inr [L] t`
     ///
     /// Corresponds to right disjunction introduction. The left type is annotated to avoid the need
     /// for bidirectional inference for now.
-    Inr { left_type: Type, right: Box<Term> },
+    Inr {
+        span: Span,
+        left_type: Type,
+        right: Box<Term>,
+    },
 
     /// `case t of | inl x => u | inr y => v`
     ///
     /// Corresponds to disjunction elimination
     Case {
+        span: Span,
         either: Box<Term>,
         left_name: String,
         left_body: Box<Term>,
@@ -300,12 +321,34 @@ pub enum Term {
     ///
     /// Corresponds to false elimination. The goal type is annotated to avoid the need for
     /// bidirectional inference for now.
-    Absurd { goal_type: Type, body: Box<Term> },
+    Absurd {
+        span: Span,
+        goal_type: Type,
+        body: Box<Term>,
+    },
 
     /// `trustme [A]`
     ///
     /// Corresponds to the assumption that A is true. Used as a placeholder.
-    TrustMe { goal_type: Type },
+    TrustMe { span: Span, goal_type: Type },
+}
+
+impl Term {
+    fn span(&self) -> Span {
+        match self {
+            Term::Var { span, .. } => *span,
+            Term::Lambda { span, .. } => *span,
+            Term::Application { span, .. } => *span,
+            Term::Pair { span, .. } => *span,
+            Term::Fst { span, .. } => *span,
+            Term::Snd { span, .. } => *span,
+            Term::Inl { span, .. } => *span,
+            Term::Inr { span, .. } => *span,
+            Term::Case { span, .. } => *span,
+            Term::Absurd { span, .. } => *span,
+            Term::TrustMe { span, .. } => *span,
+        }
+    }
 }
 
 /// Whether a proof is complete or relies on a `trustme`.
@@ -392,24 +435,26 @@ impl Default for Context {
     }
 }
 
-fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> {
+fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type> {
     match term {
         Term::Var {
+            span,
             name,
             type_arguments,
         } => {
             let (scheme, binding_trust) = ctx
                 .lookup(name)
-                .ok_or_else(|| format!("Unknown variable {}", name))?;
+                .ok_or_else(|| Diagnostic::error(format!("Unknown variable {}", name), *span))?;
 
             // Referring to an admitted theorem taints this proof too.
             trust.admit(binding_trust);
 
             // Substitute type arguments for type parameters
-            scheme.instantiate(type_arguments)
+            scheme.instantiate(*span, type_arguments)
         }
 
         Term::Lambda {
+            span: _,
             argument,
             argument_type,
             body,
@@ -428,7 +473,11 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
             })
         }
 
-        Term::Application { function, argument } => {
+        Term::Application {
+            span: _,
+            function,
+            argument,
+        } => {
             let function_type_inferred = infer(ctx, function, trust)?;
             let argument_type_inferred = infer(ctx, argument, trust)?;
 
@@ -440,20 +489,27 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
                 if argument_type_inferred == *argument_type {
                     Ok(*result_type)
                 } else {
-                    Err(format!(
-                        "Incorrect argument type in application: expected {}, but got {}",
-                        argument_type, argument_type_inferred
+                    Err(Diagnostic::error(
+                        format!(
+                            "Incorrect argument type in application: expected {}, but got {}",
+                            argument_type, argument_type_inferred
+                        ),
+                        argument.span(),
                     ))
                 }
             } else {
-                Err(format!(
-                    "Incorrect function type in application: expected function, but got {}",
-                    function_type_inferred
+                Err(Diagnostic::error(
+                    format!(
+                        "Incorrect function type in application: expected function, but got {}",
+                        function_type_inferred
+                    ),
+                    function.span(),
                 ))
             }
         }
 
         Term::Pair {
+            span: _,
             left: lhs,
             right: rhs,
         } => Ok(Type::Pair {
@@ -461,23 +517,27 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
             right_type: Box::new(infer(ctx, rhs, trust)?),
         }),
 
-        Term::Fst { pair } => match infer(ctx, pair, trust)? {
+        Term::Fst { span: _, pair } => match infer(ctx, pair, trust)? {
             Type::Pair { left_type, .. } => Ok(*left_type),
-            other => Err(format!(
-                "Incorrect type in fst: expected Pair but got {}",
-                other
+            other => Err(Diagnostic::error(
+                format!("Incorrect type in fst: expected Pair but got {}", other),
+                pair.span(),
             )),
         },
 
-        Term::Snd { pair } => match infer(ctx, pair, trust)? {
+        Term::Snd { span: _, pair } => match infer(ctx, pair, trust)? {
             Type::Pair { right_type, .. } => Ok(*right_type),
-            other => Err(format!(
-                "Incorrect type in snd: expected Pair but got {}",
-                other
+            other => Err(Diagnostic::error(
+                format!("Incorrect type in snd: expected Pair but got {}", other),
+                pair.span(),
             )),
         },
 
-        Term::Inl { right_type, left } => {
+        Term::Inl {
+            span: _,
+            right_type,
+            left,
+        } => {
             let left_type_inferred = infer(ctx, left, trust)?;
             Ok(Type::Either {
                 left_type: Box::new(left_type_inferred),
@@ -485,7 +545,11 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
             })
         }
 
-        Term::Inr { left_type, right } => {
+        Term::Inr {
+            span: _,
+            left_type,
+            right,
+        } => {
             let right_type_inferred = infer(ctx, right, trust)?;
             Ok(Type::Either {
                 left_type: Box::new(left_type.clone()),
@@ -494,6 +558,7 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
         }
 
         Term::Case {
+            span,
             either,
             left_name,
             left_body,
@@ -507,9 +572,12 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
                     right_type,
                 } => (left_type, right_type),
                 other => {
-                    return Err(format!(
-                        "Incorrect type in case value: expected Either, but got {}",
-                        other
+                    return Err(Diagnostic::error(
+                        format!(
+                            "Incorrect type in case value: expected Either, but got {}",
+                            other
+                        ),
+                        either.span(),
                     ));
                 }
             };
@@ -529,25 +597,35 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
             if left_body_type_inferred == right_body_type_inferred {
                 Ok(left_body_type_inferred)
             } else {
-                Err(format!(
-                    "Mismatched branch types in case: left branch has type {}, but right branch has type {}",
-                    left_body_type_inferred, right_body_type_inferred
+                Err(Diagnostic::error(
+                    format!(
+                        "Mismatched branch types in case: left branch has type {}, but right branch has type {}",
+                        left_body_type_inferred, right_body_type_inferred
+                    ),
+                    *span,
                 ))
             }
         }
 
-        Term::Absurd { goal_type, body } => {
+        Term::Absurd {
+            span: _,
+            goal_type,
+            body,
+        } => {
             let body_type = infer(ctx, body, trust)?;
             match body_type {
                 Type::False => Ok(goal_type.clone()),
-                other => Err(format!(
-                    "Incorrect type in absurd: expected False, but got {}",
-                    other
+                other => Err(Diagnostic::error(
+                    format!(
+                        "Incorrect type in absurd: expected False, but got {}",
+                        other
+                    ),
+                    body.span(),
                 )),
             }
         }
 
-        Term::TrustMe { goal_type } => {
+        Term::TrustMe { span: _, goal_type } => {
             // Infer the requested type, but taint the proof.
             *trust = Trust::Admitted;
             Ok(goal_type.clone())
@@ -555,13 +633,16 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type, String> 
     }
 }
 
-pub fn check(ctx: &Context, term: &Term, scheme: &Scheme) -> Result<Trust, String> {
+pub fn check(ctx: &Context, term: &Term, scheme: &Scheme) -> Result<Trust> {
     let mut trust = Trust::Proved;
     let term_type_inferred = infer(ctx, term, &mut trust)?;
     if term_type_inferred != scheme.typ {
-        return Err(format!(
-            "Incorrect type: expected {} but got {}",
-            scheme.typ, term_type_inferred
+        return Err(Diagnostic::error(
+            format!(
+                "Incorrect type: expected {} but got {}",
+                scheme.typ, term_type_inferred
+            ),
+            term.span(),
         ));
     }
     Ok(trust)

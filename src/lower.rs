@@ -112,9 +112,7 @@ fn lower_type_app(app: &surface::ast::TypeApp, scope: &TypeScope) -> Result<kern
                 .iter()
                 .map(|typ| lower_type(typ, scope))
                 .collect::<Result<Vec<_>>>()?;
-            scheme
-                .instantiate(&arguments)
-                .map_err(|e| Diagnostic::error(e, app.span))
+            scheme.instantiate(app.span, &arguments)
         }
         None => Err(
             Diagnostic::error(format!("unbound proposition {}", app.name.text), app.span)
@@ -144,9 +142,7 @@ fn lower_type_atom(atom: &surface::ast::Atom, scope: &TypeScope) -> Result<kerne
         Ok(kernel::Type::Atom { name })
     } else {
         match scope.aliases.get(&atom.name.text) {
-            Some(scheme) => scheme
-                .instantiate(&[])
-                .map_err(|err| Diagnostic::error(err, atom.span)),
+            Some(scheme) => scheme.instantiate(atom.span, &[]),
             None => Err(
                 Diagnostic::error(format!("unbound proposition {}", name), atom.span)
                     .with_note(format!("try adding {} as a type parameter", name)),
@@ -180,6 +176,7 @@ fn lower_term_var(var: &surface::ast::Var, scope: &TypeScope) -> Result<kernel::
     }
 
     Ok(kernel::Term::Var {
+        span: var.span,
         name,
         type_arguments,
     })
@@ -190,6 +187,7 @@ fn lower_term_fun(fun: &surface::ast::Fun, scope: &TypeScope) -> Result<kernel::
     let argument_type = lower_type(&fun.argument_type, scope)?;
     let body = Box::new(lower_term(&fun.body, scope)?);
     Ok(kernel::Term::Lambda {
+        span: fun.span,
         argument,
         argument_type,
         body,
@@ -199,35 +197,57 @@ fn lower_term_fun(fun: &surface::ast::Fun, scope: &TypeScope) -> Result<kernel::
 fn lower_term_app(app: &surface::ast::App, scope: &TypeScope) -> Result<kernel::Term> {
     let function = Box::new(lower_term(&app.function, scope)?);
     let argument = Box::new(lower_term(&app.argument, scope)?);
-    Ok(kernel::Term::Application { function, argument })
+    Ok(kernel::Term::Application {
+        span: app.span,
+        function,
+        argument,
+    })
 }
 
 fn lower_term_pair(pair: &surface::ast::Pair, scope: &TypeScope) -> Result<kernel::Term> {
     let left = Box::new(lower_term(&pair.left, scope)?);
     let right = Box::new(lower_term(&pair.right, scope)?);
-    Ok(kernel::Term::Pair { left, right })
+    Ok(kernel::Term::Pair {
+        span: pair.span,
+        left,
+        right,
+    })
 }
 
 fn lower_term_fst(fst: &surface::ast::Fst, scope: &TypeScope) -> Result<kernel::Term> {
     let pair = Box::new(lower_term(&fst.pair, scope)?);
-    Ok(kernel::Term::Fst { pair })
+    Ok(kernel::Term::Fst {
+        span: fst.span,
+        pair,
+    })
 }
 
 fn lower_term_snd(snd: &surface::ast::Snd, scope: &TypeScope) -> Result<kernel::Term> {
     let pair = Box::new(lower_term(&snd.pair, scope)?);
-    Ok(kernel::Term::Snd { pair })
+    Ok(kernel::Term::Snd {
+        span: snd.span,
+        pair,
+    })
 }
 
 fn lower_term_inl(inl: &surface::ast::Inl, scope: &TypeScope) -> Result<kernel::Term> {
     let right_type = lower_type(&inl.right_type, scope)?;
     let left = Box::new(lower_term(&inl.left, scope)?);
-    Ok(kernel::Term::Inl { right_type, left })
+    Ok(kernel::Term::Inl {
+        span: inl.span,
+        right_type,
+        left,
+    })
 }
 
 fn lower_term_inr(inr: &surface::ast::Inr, scope: &TypeScope) -> Result<kernel::Term> {
     let left_type = lower_type(&inr.left_type, scope)?;
     let right = Box::new(lower_term(&inr.right, scope)?);
-    Ok(kernel::Term::Inr { left_type, right })
+    Ok(kernel::Term::Inr {
+        span: inr.span,
+        left_type,
+        right,
+    })
 }
 
 fn lower_term_case(case: &surface::ast::Case, scope: &TypeScope) -> Result<kernel::Term> {
@@ -237,6 +257,7 @@ fn lower_term_case(case: &surface::ast::Case, scope: &TypeScope) -> Result<kerne
     let right_name = case.right_name.text.clone();
     let right_body = Box::new(lower_term(&case.right_body, scope)?);
     Ok(kernel::Term::Case {
+        span: case.span,
         either,
         left_name,
         left_body,
@@ -248,10 +269,17 @@ fn lower_term_case(case: &surface::ast::Case, scope: &TypeScope) -> Result<kerne
 fn lower_term_absurd(absurd: &surface::ast::Absurd, scope: &TypeScope) -> Result<kernel::Term> {
     let goal_type = lower_type(&absurd.goal_type, scope)?;
     let body = Box::new(lower_term(&absurd.body, scope)?);
-    Ok(kernel::Term::Absurd { goal_type, body })
+    Ok(kernel::Term::Absurd {
+        span: absurd.span,
+        goal_type,
+        body,
+    })
 }
 
 fn lower_term_trustme(trustme: &surface::ast::TrustMe, scope: &TypeScope) -> Result<kernel::Term> {
     let goal_type = lower_type(&trustme.goal_type, scope)?;
-    Ok(kernel::Term::TrustMe { goal_type })
+    Ok(kernel::Term::TrustMe {
+        span: trustme.span,
+        goal_type,
+    })
 }

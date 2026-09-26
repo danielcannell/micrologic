@@ -102,7 +102,7 @@ fn process_module(source: &str) -> Summary {
                         Err(err) => {
                             failed += 1;
                             println!("failed {}", theorem.name.text);
-                            diagnostics.push(Diagnostic::error(err, theorem.name.span));
+                            diagnostics.push(err);
                             kernel::Trust::Admitted
                         }
                     },
