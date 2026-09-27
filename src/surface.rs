@@ -1121,7 +1121,17 @@ mod tests {
 
     fn show_term(term: &ast::Term) -> String {
         match term {
-            ast::Term::Var(v) => v.name.text.clone(),
+            ast::Term::Var(v) => {
+                let mut out = v.name.text.clone();
+                for arg in &v.type_arguments {
+                    out.push_str(&format!(" [{}]", show_type(arg)));
+                }
+                if v.type_arguments.is_empty() {
+                    out
+                } else {
+                    format!("({out})")
+                }
+            }
             ast::Term::Fun(f) => format!(
                 "(fun {} : {} {})",
                 f.argument.text,
@@ -1178,6 +1188,22 @@ mod tests {
             ast::Item::Theorem(t) => (show_type(&t.typ), show_term(&t.body)),
             other => panic!("expected a theorem, got {:?}", other),
         }
+    }
+
+    // Render an item's name and parameters, e.g. `(proposition P A B)`.
+    fn show_item_header(item: &ast::Item) -> String {
+        let (kind, name, parameters) = match item {
+            ast::Item::Axiom(a) => ("axiom", &a.name, &a.parameters),
+            ast::Item::Theorem(t) => ("theorem", &t.name, &t.parameters),
+            ast::Item::Proposition(p) => ("proposition", &p.name, &p.parameters),
+        };
+        let mut out = format!("({kind} {}", name.text);
+        for param in parameters {
+            out.push(' ');
+            out.push_str(&param.text);
+        }
+        out.push(')');
+        out
     }
 
     fn parse_type_str(source: &str) -> String {
@@ -1300,9 +1326,105 @@ mod tests {
     }
 
     #[test]
+    fn test_type_equiv() {
+        assert_eq!(parse_type_str("A <-> B"), "(equiv A B)");
+        // `<->` binds loosest.
+        assert_eq!(parse_type_str("A -> B <-> C"), "(equiv (-> A B) C)");
+        assert_eq!(parse_type_str("A <-> B -> C"), "(equiv A (-> B C))");
+        assert_eq!(
+            parse_type_str("A and B <-> not C or D"),
+            "(equiv (and A B) (or (not C) D))"
+        );
+        // Currently right-associative, like the other binary operators.
+        assert_eq!(parse_type_str("A <-> B <-> C"), "(equiv A (equiv B C))");
+        assert_eq!(parse_type_str("(A <-> B) <-> C"), "(equiv (equiv A B) C)");
+    }
+
+    #[test]
+    fn test_type_application() {
+        assert_eq!(parse_type_str("F A B"), "(type_app F A B)");
+        // Application binds tighter than every operator, including `not`.
+        assert_eq!(parse_type_str("not F A"), "(not (type_app F A))");
+        assert_eq!(parse_type_str("F A and B"), "(and (type_app F A) B)");
+        assert_eq!(parse_type_str("F A -> B"), "(-> (type_app F A) B)");
+        assert_eq!(parse_type_str("A -> F B"), "(-> A (type_app F B))");
+        // Arguments are atoms, so application does not nest without parentheses.
+        assert_eq!(parse_type_str("F G A"), "(type_app F G A)");
+        assert_eq!(
+            parse_type_str("F (G A) True"),
+            "(type_app F (type_app G A) True)"
+        );
+        assert_eq!(
+            parse_type_str("F (A -> B) False"),
+            "(type_app F (-> A B) False)"
+        );
+        // A lone identifier is still an atom, not a nullary application.
+        assert_eq!(parse_type_str("F"), "F");
+        assert_eq!(parse_type_str("(F)"), "F");
+    }
+
+    #[test]
+    fn test_term_type_arguments() {
+        assert_eq!(parse_term_str("f [A]"), "(f [A])");
+        assert_eq!(
+            parse_term_str("f [A] [B -> C] x"),
+            "(app (f [A] [(-> B C)]) x)"
+        );
+        assert_eq!(parse_term_str("f [F A]"), "(f [(type_app F A)])");
+        // Type arguments attach to the variable, not to the application.
+        assert_eq!(parse_term_str("f x [A]"), "(app f (x [A]))");
+        // Inside other brackets.
+        assert_eq!(parse_term_str("inl [B] f [A]"), "(inl [B] (f [A]))");
+    }
+
+    #[test]
+    fn test_item_parameters() {
+        let source = r#"
+            axiom a0 : True.
+            axiom a1 A : A.
+            axiom a2 A B : A -> B.
+            theorem t0 : True := x.
+            theorem t1 A : A := x.
+            theorem t2 A B : A -> B := x.
+            proposition P0 := True.
+            proposition P1 A := not A.
+            proposition P2 A B := A and B.
+        "#;
+        let module = parse(source).expect("should parse");
+        let headers: Vec<String> = module.items.iter().map(show_item_header).collect();
+        assert_eq!(
+            headers,
+            vec![
+                "(axiom a0)",
+                "(axiom a1 A)",
+                "(axiom a2 A B)",
+                "(theorem t0)",
+                "(theorem t1 A)",
+                "(theorem t2 A B)",
+                "(proposition P0)",
+                "(proposition P1 A)",
+                "(proposition P2 A B)",
+            ]
+        );
+
+        match &module.items[8] {
+            ast::Item::Proposition(p) => assert_eq!(show_type(&p.typ), "(and A B)"),
+            other => panic!("expected proposition, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_parse_errors() {
         assert!(parse("axiom a A.").is_err()); // missing colon
         assert!(parse("theorem t : A := .").is_err()); // missing body
+        assert!(parse("theorem t : A := f [].").is_err()); // empty type arguments
+        assert!(parse("theorem t : A := f [A.").is_err()); // unclosed type arguments
+        assert!(parse("theorem t : A := f [A, B].").is_err()); // arguments are separate brackets
+        assert!(parse("theorem t : A <-> := x.").is_err()); // missing right side of `<->`
+        assert!(parse("proposition P A : A.").is_err()); // `:` instead of `:=`
+        assert!(parse("proposition P := .").is_err()); // missing body
+        assert!(parse("proposition := A.").is_err()); // missing name
+        assert!(parse("proposition P A := A").is_err()); // missing `.`
     }
 
     #[test]

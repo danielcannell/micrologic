@@ -173,3 +173,186 @@ fn main() {
         1
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn messages(summary: &Summary) -> Vec<&str> {
+        summary
+            .diagnostics
+            .iter()
+            .map(|diag| diag.message.as_str())
+            .collect()
+    }
+
+    fn assert_all_proved(source: &str) {
+        let summary = process_module(source);
+        assert_eq!(messages(&summary), Vec::<&str>::new());
+        assert_eq!((summary.admitted, summary.failed), (0, 0));
+        assert!(summary.proved > 0);
+    }
+
+    #[test]
+    fn test_examples() {
+        assert_all_proved(include_str!("../examples/example.ml"));
+        assert_all_proved(include_str!("../examples/knights_and_knaves.ml"));
+    }
+
+    #[test]
+    fn test_polymorphic_theorem_reuse() {
+        assert_all_proved(
+            r#"
+            theorem swap A B : A and B -> B and A :=
+                fun (p : A and B) => (snd p, fst p).
+            theorem swap_back A B : B and A -> A and B :=
+                swap [B] [A].
+            theorem swap_twice A B : A and B -> A and B :=
+                fun (p : A and B) => swap [B] [A] (swap [A] [B] p).
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_alias_is_transparent() {
+        // `Knave A` and `not A` are interchangeable in both directions.
+        assert_all_proved(
+            r#"
+            proposition Knave A := not A.
+            theorem into A : not A -> Knave A := fun (x : not A) => x.
+            theorem out_of A : Knave A -> not A := fun (x : Knave A) => x.
+            theorem apply A : Knave A -> A -> False := fun (x : Knave A) => fun (a : A) => x a.
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_non_theorems_are_rejected() {
+        // Plausible-looking "proofs" of things that aren't intuitionistic theorems.
+        let attempts = [
+            "theorem bad A B : A -> B := fun (x : A) => x.",
+            "theorem bad A : A := absurd [A] (fun (f : False) => f).",
+            "theorem bad A : not not A -> A := fun (h : not not A) => absurd [A] h.",
+            "theorem bad A B : A or B -> A := fun (h : A or B) => case h of | inl x => x | inr y => y.",
+            "theorem bad A B : (A -> B) -> B -> A := fun (f : A -> B) => fun (b : B) => f b.",
+            "theorem id A : A -> A := fun (x : A) => x.\ntheorem bad : False := id [False].",
+        ];
+        for source in attempts {
+            let summary = process_module(source);
+            assert_eq!(summary.failed, 1, "should reject:\n{source}");
+            assert_eq!(summary.diagnostics.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_free_atom_cannot_be_captured() {
+        // If `ax : A` were accepted with a free `A`, `bad` would generalise over it and
+        // `bad [False]` would prove False. The axiom is rejected, and checking stops there.
+        let summary = process_module(
+            r#"
+            axiom ax : A.
+            theorem bad A : A := ax.
+            theorem boom : False := bad [False].
+            "#,
+        );
+        assert_eq!(messages(&summary), vec!["unbound proposition A"]);
+        assert_eq!(
+            (summary.proved, summary.admitted, summary.failed),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn test_admitted_taints_transitively() {
+        let summary = process_module(
+            r#"
+            theorem hole A : A -> A := trustme [A -> A].
+            theorem user A : A -> A := hole [A].
+            theorem user_of_user A : A -> A := user [A].
+            theorem independent A : A -> A := fun (x : A) => x.
+            "#,
+        );
+        assert_eq!(messages(&summary), Vec::<&str>::new());
+        assert_eq!(
+            (summary.proved, summary.admitted, summary.failed),
+            (1, 3, 0)
+        );
+    }
+
+    #[test]
+    fn test_failed_theorem_is_bound_as_admitted() {
+        // Later references resolve (no "Unknown variable" cascade) but are never reported proved.
+        let summary = process_module(
+            r#"
+            theorem broken A : A -> A := fun (x : A) => fst x.
+            theorem unlowerable A : A -> A := fun (x : B) => x.
+            theorem user1 A : A -> A := broken [A].
+            theorem user2 A : A -> A := unlowerable [A].
+            "#,
+        );
+        assert_eq!(
+            messages(&summary),
+            vec![
+                "Incorrect type in fst: expected Pair but got A",
+                "unbound proposition B",
+            ]
+        );
+        assert_eq!(
+            (summary.proved, summary.admitted, summary.failed),
+            (0, 2, 2)
+        );
+    }
+
+    #[test]
+    fn test_signature_error_stops_checking() {
+        let summary = process_module(
+            r#"
+            theorem before A : A -> A := fun (x : A) => x.
+            theorem bad A : B := trustme [B].
+            theorem after A : A -> A := fun (x : A) => x.
+            "#,
+        );
+        assert_eq!(messages(&summary), vec!["unbound proposition B"]);
+        assert_eq!(
+            (summary.proved, summary.admitted, summary.failed),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn test_redefinition() {
+        let source = r#"
+            proposition Knave A := not A.
+            proposition Knave A := A.
+        "#;
+        let summary = process_module(source);
+        assert_eq!(messages(&summary), vec!["redefinition of Knave"]);
+        let labels = &summary.diagnostics[0].labels;
+        assert_eq!(labels[0].span.start, source.rfind("Knave").unwrap());
+        assert_eq!(labels[1].span.start, source.find("Knave").unwrap());
+
+        // Theorems, axioms and propositions share one namespace for redefinition.
+        for source in [
+            "theorem t A : A -> A := fun (x : A) => x.\ntheorem t A : A -> A := fun (x : A) => x.",
+            "axiom t A : A.\ntheorem t A : A -> A := fun (x : A) => x.",
+            "proposition t A := A.\naxiom t A : A.",
+        ] {
+            let summary = process_module(source);
+            assert_eq!(
+                messages(&summary),
+                vec!["redefinition of t"],
+                "in:\n{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_error() {
+        let summary = process_module("theorem t : A := .");
+        assert_eq!(summary.diagnostics.len(), 1);
+        assert_eq!(
+            (summary.proved, summary.admitted, summary.failed),
+            (0, 0, 0)
+        );
+    }
+}

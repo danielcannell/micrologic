@@ -647,3 +647,276 @@ pub fn check(ctx: &Context, term: &Term, scheme: &Scheme) -> Result<Trust> {
     }
     Ok(trust)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Kernel terms are built directly here, so spans don't matter.
+    const NO_SPAN: Span = Span { start: 0, end: 0 };
+
+    fn atom(name: &str) -> Type {
+        Type::Atom {
+            name: name.to_string(),
+        }
+    }
+
+    fn arrow(argument_type: Type, result_type: Type) -> Type {
+        Type::Lambda {
+            argument_type: Box::new(argument_type),
+            result_type: Box::new(result_type),
+        }
+    }
+
+    fn and(left_type: Type, right_type: Type) -> Type {
+        Type::Pair {
+            left_type: Box::new(left_type),
+            right_type: Box::new(right_type),
+        }
+    }
+
+    fn scheme(params: &[&str], typ: Type) -> Scheme {
+        Scheme::new(params.iter().map(|p| p.to_string()).collect(), typ)
+    }
+
+    fn var(name: &str, type_arguments: Vec<Type>) -> Term {
+        Term::Var {
+            span: NO_SPAN,
+            name: name.to_string(),
+            type_arguments,
+        }
+    }
+
+    fn lam(argument: &str, argument_type: Type, body: Term) -> Term {
+        Term::Lambda {
+            span: NO_SPAN,
+            argument: argument.to_string(),
+            argument_type,
+            body: Box::new(body),
+        }
+    }
+
+    fn app(function: Term, argument: Term) -> Term {
+        Term::Application {
+            span: NO_SPAN,
+            function: Box::new(function),
+            argument: Box::new(argument),
+        }
+    }
+
+    fn fst(pair: Term) -> Term {
+        Term::Fst {
+            span: NO_SPAN,
+            pair: Box::new(pair),
+        }
+    }
+
+    fn trustme(goal_type: Type) -> Term {
+        Term::TrustMe {
+            span: NO_SPAN,
+            goal_type,
+        }
+    }
+
+    // `swap A B : A and B -> B and A`
+    fn swap_scheme() -> Scheme {
+        scheme(
+            &["A", "B"],
+            arrow(and(atom("A"), atom("B")), and(atom("B"), atom("A"))),
+        )
+    }
+
+    // `id A : A -> A`
+    fn id_scheme() -> Scheme {
+        scheme(&["A"], arrow(atom("A"), atom("A")))
+    }
+
+    fn error_message(result: Result<Trust>) -> String {
+        match result {
+            Ok(trust) => panic!("expected an error, got {:?}", trust),
+            Err(diag) => diag.message,
+        }
+    }
+
+    #[test]
+    fn test_instantiate_is_simultaneous() {
+        // Substituting A := B then B := A one at a time would give `A and A -> A and A`.
+        let instantiated = swap_scheme()
+            .instantiate(NO_SPAN, &[atom("B"), atom("A")])
+            .unwrap();
+        assert_eq!(
+            instantiated,
+            arrow(and(atom("B"), atom("A")), and(atom("A"), atom("B")))
+        );
+    }
+
+    #[test]
+    fn test_instantiate_with_compound_type() {
+        let a_to_a = arrow(atom("A"), atom("A"));
+        let instantiated = id_scheme().instantiate(NO_SPAN, &[a_to_a.clone()]).unwrap();
+        assert_eq!(instantiated, arrow(a_to_a.clone(), a_to_a));
+    }
+
+    #[test]
+    fn test_instantiate_monomorphic() {
+        let typ = arrow(Type::False, Type::False);
+        let instantiated = scheme(&[], typ.clone()).instantiate(NO_SPAN, &[]).unwrap();
+        assert_eq!(instantiated, typ);
+    }
+
+    #[test]
+    fn test_instantiate_rejects_wrong_arity() {
+        let too_few = id_scheme().instantiate(NO_SPAN, &[]).unwrap_err();
+        assert_eq!(too_few.message, "expected 1 type argument but got 0");
+
+        let too_many = id_scheme()
+            .instantiate(NO_SPAN, &[atom("A"), atom("B")])
+            .unwrap_err();
+        assert_eq!(too_many.message, "expected 1 type argument but got 2");
+
+        let for_mono = scheme(&[], Type::False)
+            .instantiate(NO_SPAN, &[atom("A")])
+            .unwrap_err();
+        assert_eq!(for_mono.message, "expected 0 type arguments but got 1");
+    }
+
+    #[test]
+    #[should_panic(expected = "unbound atoms")]
+    fn test_scheme_rejects_free_atom() {
+        // `ax A : B` would let `B` leak into the context, where a later theorem generalising over
+        // its own `B` could capture it.
+        scheme(&["A"], arrow(atom("A"), atom("B")));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate")]
+    fn test_scheme_rejects_duplicate_parameters() {
+        scheme(&["A", "A"], atom("A"));
+    }
+
+    #[test]
+    fn test_polymorphic_theorem_used_at_swapped_arguments() {
+        // theorem t A B : B and A -> A and B := swap [B] [A]
+        let ctx = Context::new().bind("swap".to_string(), swap_scheme());
+        let goal = scheme(
+            &["A", "B"],
+            arrow(and(atom("B"), atom("A")), and(atom("A"), atom("B"))),
+        );
+        let body = var("swap", vec![atom("B"), atom("A")]);
+        assert_eq!(check(&ctx, &body, &goal).unwrap(), Trust::Proved);
+    }
+
+    #[test]
+    fn test_polymorphic_theorem_used_at_compound_type() {
+        // theorem t A : (A -> A) -> (A -> A) := id [A -> A]
+        let ctx = Context::new().bind("id".to_string(), id_scheme());
+        let a_to_a = arrow(atom("A"), atom("A"));
+        let goal = scheme(&["A"], arrow(a_to_a.clone(), a_to_a.clone()));
+        let body = var("id", vec![a_to_a]);
+        assert_eq!(check(&ctx, &body, &goal).unwrap(), Trust::Proved);
+    }
+
+    #[test]
+    fn test_polymorphic_theorem_used_without_type_arguments() {
+        let ctx = Context::new().bind("id".to_string(), id_scheme());
+        let goal = scheme(&["A"], arrow(atom("A"), atom("A")));
+        let body = var("id", vec![]);
+        assert_eq!(
+            error_message(check(&ctx, &body, &goal)),
+            "expected 1 type argument but got 0"
+        );
+    }
+
+    #[test]
+    fn test_local_variable_with_type_arguments() {
+        // fun (x : A) => x [A]
+        let goal = scheme(&["A"], arrow(atom("A"), atom("A")));
+        let body = lam("x", atom("A"), var("x", vec![atom("A")]));
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal)),
+            "expected 0 type arguments but got 1"
+        );
+    }
+
+    #[test]
+    fn test_local_binder_shadows_polymorphic_theorem() {
+        // fun (id : A) => id  -- the local `id` is monomorphic, so takes no type arguments.
+        let ctx = Context::new().bind("id".to_string(), id_scheme());
+        let goal = scheme(&["A"], arrow(atom("A"), atom("A")));
+        let body = lam("id", atom("A"), var("id", vec![]));
+        assert_eq!(check(&ctx, &body, &goal).unwrap(), Trust::Proved);
+    }
+
+    #[test]
+    fn test_parameters_are_rigid() {
+        // theorem bad A B : A -> B := fun (x : A) => x
+        let goal = scheme(&["A", "B"], arrow(atom("A"), atom("B")));
+        let body = lam("x", atom("A"), var("x", vec![]));
+        assert!(check(&Context::new(), &body, &goal).is_err());
+    }
+
+    #[test]
+    fn test_instantiation_cannot_prove_false() {
+        // With `id A : A -> A`, instantiating at False gives `False -> False`, never `False`.
+        let ctx = Context::new().bind("id".to_string(), id_scheme());
+        let goal = scheme(&[], Type::False);
+        let body = var("id", vec![Type::False]);
+        assert!(check(&ctx, &body, &goal).is_err());
+    }
+
+    #[test]
+    fn test_rejects_ill_typed_eliminations() {
+        let goal = scheme(&["A"], arrow(atom("A"), atom("A")));
+
+        // fun (x : A) => fst x
+        let body = lam("x", atom("A"), fst(var("x", vec![])));
+        assert!(check(&Context::new(), &body, &goal).is_err());
+
+        // fun (x : A) => x x
+        let body = lam("x", atom("A"), app(var("x", vec![]), var("x", vec![])));
+        assert!(check(&Context::new(), &body, &goal).is_err());
+
+        // fun (x : A) => absurd [A] x
+        let body = lam(
+            "x",
+            atom("A"),
+            Term::Absurd {
+                span: NO_SPAN,
+                goal_type: atom("A"),
+                body: Box::new(var("x", vec![])),
+            },
+        );
+        assert!(check(&Context::new(), &body, &goal).is_err());
+    }
+
+    #[test]
+    fn test_unknown_variable() {
+        let goal = scheme(&[], Type::False);
+        assert_eq!(
+            error_message(check(&Context::new(), &var("nope", vec![]), &goal)),
+            "Unknown variable nope"
+        );
+    }
+
+    #[test]
+    fn test_trustme_is_admitted() {
+        let goal = scheme(&[], Type::False);
+        assert_eq!(
+            check(&Context::new(), &trustme(Type::False), &goal).unwrap(),
+            Trust::Admitted
+        );
+    }
+
+    #[test]
+    fn test_admitted_theorem_taints_users() {
+        let goal = scheme(&["A"], arrow(atom("A"), atom("A")));
+        let body = var("id", vec![atom("A")]);
+
+        let proved = Context::new().bind_with_trust("id".to_string(), id_scheme(), Trust::Proved);
+        assert_eq!(check(&proved, &body, &goal).unwrap(), Trust::Proved);
+
+        let admitted =
+            Context::new().bind_with_trust("id".to_string(), id_scheme(), Trust::Admitted);
+        assert_eq!(check(&admitted, &body, &goal).unwrap(), Trust::Admitted);
+    }
+}
