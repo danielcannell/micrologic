@@ -30,7 +30,8 @@ impl From<Span> for Range<usize> {
 #[derive(Debug, Clone)]
 pub struct Label {
     pub span: Span,
-    pub message: String,
+    /// Text shown next to the underline. `None` underlines without comment.
+    pub message: Option<String>,
 }
 
 /// A source-free description of a compile error. It carries everything needed
@@ -47,24 +48,30 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    /// A diagnostic with a single primary label at `span`.
+    /// A diagnostic whose primary location is `span`. `message` is the headline: it says what is
+    /// wrong. Use [`Diagnostic::with_primary_label`] to say what is wrong *here*.
     pub fn error(message: impl Into<String>, span: Span) -> Self {
-        let message = message.into();
         Diagnostic {
+            message: message.into(),
             labels: vec![Label {
                 span,
-                message: message.clone(),
+                message: None,
             }],
-            message,
             notes: Vec::new(),
         }
+    }
+
+    /// Set the text shown at the primary location.
+    pub fn with_primary_label(mut self, message: impl Into<String>) -> Self {
+        self.labels[0].message = Some(message.into());
+        self
     }
 
     /// Attach an additional annotated location.
     pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Self {
         self.labels.push(Label {
             span,
-            message: message.into(),
+            message: Some(message.into()),
         });
         self
     }
@@ -75,20 +82,24 @@ impl Diagnostic {
         self
     }
 
-    /// Render this diagnostic against `source` and print it to stderr.
-    pub fn emit(&self, source: &str) {
+    /// Render this diagnostic against `source`, read from the file `filename`, and print it to
+    /// stderr.
+    pub fn emit(&self, filename: &str, source: &str) {
         let primary = self
             .labels
             .first()
             .map(|label| Range::from(label.span))
             .unwrap_or(0..0);
 
-        let mut builder = Report::build(ReportKind::Error, primary).with_message(&self.message);
+        let mut builder =
+            Report::build(ReportKind::Error, (filename, primary)).with_message(&self.message);
 
         for label in &self.labels {
-            builder = builder.with_label(
-                AriadneLabel::new(Range::from(label.span)).with_message(&label.message),
-            );
+            let mut ariadne_label = AriadneLabel::new((filename, Range::from(label.span)));
+            if let Some(message) = &label.message {
+                ariadne_label = ariadne_label.with_message(message);
+            }
+            builder = builder.with_label(ariadne_label);
         }
         for note in &self.notes {
             builder = builder.with_note(note);
@@ -98,7 +109,7 @@ impl Diagnostic {
         // nothing useful to recover to.
         builder
             .finish()
-            .eprint(Source::from(source))
+            .eprint((filename, Source::from(source)))
             .expect("failed to write diagnostic");
     }
 }

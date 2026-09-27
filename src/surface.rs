@@ -93,6 +93,22 @@ pub mod ast {
         Atom(Atom),
     }
 
+    impl Type {
+        pub fn span(&self) -> Span {
+            match self {
+                Type::Equiv(t) => t.span,
+                Type::Lambda(t) => t.span,
+                Type::Or(t) => t.span,
+                Type::And(t) => t.span,
+                Type::Not(t) => t.span,
+                Type::App(t) => t.span,
+                Type::True(t) => t.span,
+                Type::False(t) => t.span,
+                Type::Atom(t) => t.span,
+            }
+        }
+    }
+
     /// `left_type <-> right_type`
     #[derive(Debug, Clone)]
     pub struct Equiv {
@@ -1009,7 +1025,7 @@ impl<'source> Parser<'source> {
             self.advance();
             Ok(())
         } else {
-            self.unexpected(describe(kind))
+            self.unexpected_token(kind)
         }
     }
 
@@ -1029,19 +1045,105 @@ impl<'source> Parser<'source> {
         }
     }
 
-    /// Build an "expected X, but found Y" diagnostic pointing at the current
-    /// token, describing the current token in a reader-friendly way.
+    /// Build an "expected X, found Y" diagnostic pointing at the current token, describing the
+    /// current token in a reader-friendly way.
     fn unexpected<T>(&self, expected: &str) -> Result<T> {
+        Err(self.unexpected_diagnostic(expected))
+    }
+
+    fn unexpected_diagnostic(&self, expected: &str) -> Diagnostic {
         let found = match self.current.kind {
             TokenKind::Eof => "end of input".to_string(),
             TokenKind::InvalidToken => format!("invalid token `{}`", self.current.text),
             _ => format!("`{}`", self.current.text),
         };
-        Err(Diagnostic::error(
-            format!("expected {expected}, but found {found}"),
+        let mut diag = Diagnostic::error(
+            format!("expected {expected}, found {found}"),
             self.current.span,
-        ))
+        )
+        .with_primary_label(format!("expected {expected}"));
+
+        if self.current.kind == TokenKind::InvalidToken {
+            let suggestion = match self.current.text {
+                "-" => Some("->"),
+                "<" | "<-" => Some("<->"),
+                _ => None,
+            };
+            if let Some(suggestion) = suggestion {
+                diag = diag.with_note(format!("did you mean `{suggestion}`?"));
+            }
+        }
+
+        diag
     }
+
+    /// Like [`Parser::unexpected`], with hints for common mistakes when a specific token was
+    /// expected.
+    fn unexpected_token<T>(&self, expected: TokenKind) -> Result<T> {
+        // A forgotten `.` is noticed at the start of the next item, which may be lines away. Point
+        // at the end of the item instead.
+        let at_item_boundary = matches!(
+            self.current.kind,
+            TokenKind::Axiom | TokenKind::Theorem | TokenKind::Proposition | TokenKind::Eof
+        );
+        if expected == TokenKind::Dot && at_item_boundary {
+            return Err(Diagnostic::error(
+                "expected `.` at the end of the item",
+                self.previous.span,
+            )
+            .with_primary_label("expected `.` after this"));
+        }
+
+        let note = match (expected, self.current.kind) {
+            (TokenKind::Ident, found) if is_keyword(found) => Some(format!(
+                "`{}` is a keyword and cannot be used as a name",
+                self.current.text
+            )),
+            (TokenKind::ColonEqual, TokenKind::Equal) => {
+                Some("definitions use `:=`, not `=`".to_string())
+            }
+            (TokenKind::ColonEqual, TokenKind::Colon) => {
+                Some("a proposition is defined with `:=`: `proposition Name A B := ...`".to_string())
+            }
+            (TokenKind::Colon, TokenKind::ColonEqual) => Some(
+                "theorems and axioms need a statement after `:`: `theorem name A B : statement := proof`"
+                    .to_string(),
+            ),
+            (TokenKind::FatArrow, TokenKind::Equal) => {
+                Some("`fun` and `case` arms use `=>`, not `=`".to_string())
+            }
+            _ => None,
+        };
+
+        let diag = self.unexpected_diagnostic(describe(expected));
+        Err(match note {
+            Some(note) => diag.with_note(note),
+            None => diag,
+        })
+    }
+}
+
+fn is_keyword(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Axiom
+            | TokenKind::Theorem
+            | TokenKind::Proposition
+            | TokenKind::Or
+            | TokenKind::And
+            | TokenKind::Not
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::Fun
+            | TokenKind::Case
+            | TokenKind::Of
+            | TokenKind::Inl
+            | TokenKind::Inr
+            | TokenKind::Fst
+            | TokenKind::Snd
+            | TokenKind::Absurd
+            | TokenKind::TrustMe
+    )
 }
 
 /// A reader-friendly description of a token kind, used in "expected ..." messages.
@@ -1425,6 +1527,56 @@ mod tests {
         assert!(parse("proposition P := .").is_err()); // missing body
         assert!(parse("proposition := A.").is_err()); // missing name
         assert!(parse("proposition P A := A").is_err()); // missing `.`
+    }
+
+    fn parse_error(source: &str) -> crate::diagnostics::Diagnostic {
+        match parse(source) {
+            Ok(_) => panic!("expected `{source}` to fail to parse"),
+            Err(diag) => diag,
+        }
+    }
+
+    #[test]
+    fn test_parse_error_messages() {
+        let diag = parse_error("theorem t : A := x");
+        assert_eq!(diag.message, "expected `.` at the end of the item");
+
+        // A forgotten `.` is reported at the end of the item, not at the next one.
+        let source = "theorem t : A := x\n\ntheorem u : A := x.";
+        let diag = parse_error(source);
+        assert_eq!(diag.message, "expected `.` at the end of the item");
+        assert_eq!(diag.labels[0].span.start, source.find("x").unwrap());
+
+        // Other junk is reported where it is.
+        let source = "theorem t : A := x ).";
+        let diag = parse_error(source);
+        assert_eq!(diag.message, "expected `.`, found `)`");
+        assert_eq!(diag.labels[0].span.start, source.find(")").unwrap());
+
+        let hints = [
+            (
+                "theorem or : A := x.",
+                "`or` is a keyword and cannot be used as a name",
+            ),
+            ("theorem t : A = x.", "definitions use `:=`, not `=`"),
+            (
+                "proposition P A : A.",
+                "a proposition is defined with `:=`: `proposition Name A B := ...`",
+            ),
+            (
+                "theorem t A := x.",
+                "theorems and axioms need a statement after `:`: `theorem name A B : statement := proof`",
+            ),
+            (
+                "theorem t : A := fun (x : A) = x.",
+                "`fun` and `case` arms use `=>`, not `=`",
+            ),
+            ("theorem t : A - B := x.", "did you mean `->`?"),
+            ("theorem t : A <- B := x.", "did you mean `<->`?"),
+        ];
+        for (source, hint) in hints {
+            assert_eq!(parse_error(source).notes, vec![hint], "for `{source}`");
+        }
     }
 
     #[test]

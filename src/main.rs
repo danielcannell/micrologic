@@ -44,22 +44,34 @@ fn process_module(source: &str) -> Summary {
 
     let mut ctx = kernel::Context::new();
     let mut aliases: HashMap<String, kernel::Scheme> = HashMap::new();
-    let mut bound: HashMap<String, Span> = HashMap::new();
+    // Every item's name, what kind of item it is, and where it was defined.
+    let mut bound: HashMap<String, (&str, Span)> = HashMap::new();
 
     // TODO: Print error if we bail early; print skipped for skipped things
 
     for item in &module.items {
-        let name = match item {
-            surface::ast::Item::Axiom(axiom) => axiom.name.clone(),
-            surface::ast::Item::Theorem(theorem) => theorem.name.clone(),
-            surface::ast::Item::Proposition(proposition) => proposition.name.clone(),
+        let (kind, name) = match item {
+            surface::ast::Item::Axiom(axiom) => ("axiom", &axiom.name),
+            surface::ast::Item::Theorem(theorem) => ("theorem", &theorem.name),
+            surface::ast::Item::Proposition(proposition) => ("proposition", &proposition.name),
         };
 
-        if let Some(prev_span) = bound.insert(name.text.clone(), name.span) {
-            diagnostics.push(
-                Diagnostic::error(format!("redefinition of {}", name.text), name.span)
-                    .with_label(prev_span, "previous definition was here"),
-            );
+        if let Some((prev_kind, prev_span)) = bound.insert(name.text.clone(), (kind, name.span)) {
+            let mut diag = Diagnostic::error(
+                format!("`{}` is defined more than once", name.text),
+                name.span,
+            )
+            .with_primary_label("redefined here")
+            .with_label(prev_span, "first defined here");
+            if prev_kind != kind {
+                diag = diag.with_note(format!(
+                    "`{}` was first defined as {} {prev_kind}; theorems, axioms and propositions \
+                     share one set of names",
+                    name.text,
+                    if prev_kind == "axiom" { "an" } else { "a" },
+                ));
+            }
+            diagnostics.push(diag);
 
             continue;
         }
@@ -69,6 +81,7 @@ fn process_module(source: &str) -> Summary {
                 let scope = TypeScope {
                     parameters: &axiom.parameters,
                     aliases: &aliases,
+                    defining: None,
                 };
                 let parameters = try_!(lower::lower_type_parameters(&axiom.parameters));
                 let typ = try_!(lower::lower_type(&axiom.typ, &scope));
@@ -82,13 +95,14 @@ fn process_module(source: &str) -> Summary {
                 let scope = TypeScope {
                     parameters: &theorem.parameters,
                     aliases: &aliases,
+                    defining: None,
                 };
                 let parameters = try_!(lower::lower_type_parameters(&theorem.parameters));
                 let typ = try_!(lower::lower_type(&theorem.typ, &scope));
                 let scheme = kernel::Scheme::new(parameters, typ.clone());
 
                 let trust = match lower::lower_term(&theorem.body, &scope) {
-                    Ok(body) => match kernel::check(&ctx, &body, &scheme) {
+                    Ok(body) => match kernel::check(&ctx, &body, &scheme, theorem.typ.span()) {
                         Ok(kernel::Trust::Proved) => {
                             proved += 1;
                             println!("ok {}", theorem.name.text);
@@ -120,6 +134,7 @@ fn process_module(source: &str) -> Summary {
                 let scope = TypeScope {
                     parameters: &proposition.parameters,
                     aliases: &aliases,
+                    defining: Some(&proposition.name.text),
                 };
                 let parameters = try_!(lower::lower_type_parameters(&proposition.parameters));
                 let typ = try_!(lower::lower_type(&proposition.typ, &scope));
@@ -163,8 +178,9 @@ fn main() {
         summary.proved, summary.admitted, summary.failed
     );
 
+    let filename = args.source_file.display().to_string();
     for diagnostic in &summary.diagnostics {
-        diagnostic.emit(&source);
+        diagnostic.emit(&filename, &source);
     }
 
     std::process::exit(if summary.failed == 0 && summary.diagnostics.is_empty() {
@@ -255,7 +271,7 @@ mod tests {
             theorem boom : False := bad [False].
             "#,
         );
-        assert_eq!(messages(&summary), vec!["unbound proposition A"]);
+        assert_eq!(messages(&summary), vec!["cannot find proposition `A`"]);
         assert_eq!(
             (summary.proved, summary.admitted, summary.failed),
             (0, 0, 0)
@@ -281,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_failed_theorem_is_bound_as_admitted() {
-        // Later references resolve (no "Unknown variable" cascade) but are never reported proved.
+        // Later references resolve (no "cannot find" cascade) but are never reported proved.
         let summary = process_module(
             r#"
             theorem broken A : A -> A := fun (x : A) => fst x.
@@ -293,8 +309,8 @@ mod tests {
         assert_eq!(
             messages(&summary),
             vec![
-                "Incorrect type in fst: expected Pair but got A",
-                "unbound proposition B",
+                "`fst` expects a proof of a conjunction",
+                "cannot find proposition `B`",
             ]
         );
         assert_eq!(
@@ -312,7 +328,7 @@ mod tests {
             theorem after A : A -> A := fun (x : A) => x.
             "#,
         );
-        assert_eq!(messages(&summary), vec!["unbound proposition B"]);
+        assert_eq!(messages(&summary), vec!["cannot find proposition `B`"]);
         assert_eq!(
             (summary.proved, summary.admitted, summary.failed),
             (1, 0, 0)
@@ -326,7 +342,10 @@ mod tests {
             proposition Knave A := A.
         "#;
         let summary = process_module(source);
-        assert_eq!(messages(&summary), vec!["redefinition of Knave"]);
+        assert_eq!(
+            messages(&summary),
+            vec!["`Knave` is defined more than once"]
+        );
         let labels = &summary.diagnostics[0].labels;
         assert_eq!(labels[0].span.start, source.rfind("Knave").unwrap());
         assert_eq!(labels[1].span.start, source.find("Knave").unwrap());
@@ -340,7 +359,7 @@ mod tests {
             let summary = process_module(source);
             assert_eq!(
                 messages(&summary),
-                vec!["redefinition of t"],
+                vec!["`t` is defined more than once"],
                 "in:\n{source}"
             );
         }
@@ -353,6 +372,102 @@ mod tests {
         assert_eq!(
             (summary.proved, summary.admitted, summary.failed),
             (0, 0, 0)
+        );
+    }
+
+    // Each label of the first diagnostic, as (source text under it, label message).
+    fn labels(source: &str) -> Vec<(String, String)> {
+        let summary = process_module(source);
+        let diag = summary.diagnostics.first().expect("expected a diagnostic");
+        diag.labels
+            .iter()
+            .map(|label| {
+                (
+                    source[label.span.start..label.span.end].to_string(),
+                    label.message.clone().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    fn pair(text: &str, message: &str) -> (String, String) {
+        (text.to_string(), message.to_string())
+    }
+
+    #[test]
+    fn test_mismatch_is_reported_at_innermost_sub_term() {
+        let statement = pair("A -> B", "expected because of this statement");
+        assert_eq!(
+            labels("theorem t A B : A -> B := fun (x : A) => x."),
+            vec![pair("x", "this has type `A`"), statement.clone()]
+        );
+        assert_eq!(
+            labels("theorem t A B : A -> B := fun (x : B) => x."),
+            vec![
+                pair(
+                    "fun (x : B) => x",
+                    "`x` is declared as `B`, but `A` is expected"
+                ),
+                statement,
+            ]
+        );
+        assert_eq!(
+            labels("theorem t A B : A and B -> B and A := fun (p : A and B) => (fst p, snd p)."),
+            vec![
+                pair("fst p", "this has type `A`"),
+                pair("A and B -> B and A", "expected because of this statement"),
+            ]
+        );
+        assert_eq!(
+            labels(
+                "theorem t A B : A or B -> A := fun (h : A or B) => case h of | inl x => x | inr y => y."
+            ),
+            vec![
+                pair("y", "this has type `B`"),
+                pair("A or B -> A", "expected because of this statement"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_errors_unrelated_to_the_statement_do_not_point_at_it() {
+        assert_eq!(
+            labels("theorem t A B : (A -> B) -> B -> B := fun (f : A -> B) => fun (b : B) => f b."),
+            vec![
+                pair("b", "this has type `B`"),
+                pair("f", "this has type `A -> B`"),
+            ]
+        );
+        assert_eq!(
+            labels("theorem t A : A -> A := fun (x : A) => y."),
+            vec![pair("y", "not a hypothesis, theorem or axiom")]
+        );
+    }
+
+    #[test]
+    fn test_messages_use_surface_syntax() {
+        let summary = process_module(
+            "proposition Knave A := not A.\ntheorem t A : Knave A <-> True := trustme [A].",
+        );
+        assert_eq!(
+            messages(&summary),
+            vec!["mismatched types: expected `not A <-> True`, found `A`"]
+        );
+    }
+
+    #[test]
+    fn test_type_arity_note() {
+        let summary = process_module(
+            "theorem swap A B : A and B -> B and A := fun (p : A and B) => (snd p, fst p).\n\
+             theorem t A B : A and B -> B and A := swap.",
+        );
+        assert_eq!(
+            messages(&summary),
+            vec!["`swap` takes 2 type arguments but 0 were supplied"]
+        );
+        assert_eq!(
+            summary.diagnostics[0].notes,
+            vec!["`swap` has type parameters `A`, `B`; supply one type for each: `swap [A] [B]`"]
         );
     }
 }

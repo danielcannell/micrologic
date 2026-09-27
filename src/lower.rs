@@ -1,4 +1,4 @@
-use crate::diagnostics::{Diagnostic, Result};
+use crate::diagnostics::{Diagnostic, Result, Span};
 use crate::kernel;
 use crate::surface;
 use std::collections::HashMap;
@@ -6,6 +6,9 @@ use std::collections::HashMap;
 pub struct TypeScope<'a> {
     pub parameters: &'a [surface::ast::Ident],
     pub aliases: &'a HashMap<String, kernel::Scheme>,
+    /// The proposition whose body is being lowered, if any. Only used to explain errors: the
+    /// proposition isn't in `aliases` yet, so it can't refer to itself.
+    pub defining: Option<&'a str>,
 }
 
 pub fn lower_type_parameters(parameters: &[surface::ast::Ident]) -> Result<Vec<String>> {
@@ -16,10 +19,11 @@ pub fn lower_type_parameters(parameters: &[surface::ast::Ident]) -> Result<Vec<S
         // If the seen set already contained the parameter
         if let Some(prev_span) = seen.insert(&param.text, param.span) {
             return Err(Diagnostic::error(
-                format!("duplicate parameter {}", param.text),
+                format!("parameter `{}` is declared more than once", param.text),
                 param.span,
             )
-            .with_label(prev_span, format!("previous declaration of {}", param.text)));
+            .with_primary_label("declared again here")
+            .with_label(prev_span, "first declared here"));
         }
 
         params.push(param.text.clone());
@@ -94,30 +98,102 @@ fn lower_type_not(not: &surface::ast::Not, scope: &TypeScope) -> Result<kernel::
 }
 
 fn lower_type_app(app: &surface::ast::TypeApp, scope: &TypeScope) -> Result<kernel::Type> {
-    let found_param = scope
-        .parameters
-        .iter()
-        .any(|ident| ident.text == app.name.text);
-    if found_param {
-        return Err(Diagnostic::error(
-            format!("{} is a parameter and takes no arguments", app.name.text),
+    let name = &app.name.text;
+
+    if is_parameter(name, scope) {
+        let mut diag = Diagnostic::error(
+            format!("parameter `{name}` cannot be applied to arguments"),
             app.span,
+        )
+        .with_primary_label(format!(
+            "`{name}` is a parameter, not a defined proposition"
         ));
+        if scope.aliases.contains_key(name) {
+            diag = diag.with_note(format!(
+                "the parameter `{name}` hides the proposition `{name}` defined earlier"
+            ));
+        }
+        return Err(diag);
     }
 
-    match scope.aliases.get(&app.name.text) {
+    match scope.aliases.get(name) {
         Some(scheme) => {
             let arguments = app
                 .arguments
                 .iter()
                 .map(|typ| lower_type(typ, scope))
                 .collect::<Result<Vec<_>>>()?;
-            scheme.instantiate(app.span, &arguments)
+            scheme
+                .instantiate(&arguments)
+                .map_err(|mismatch| alias_arity_error(name, scheme, mismatch, app.span))
         }
-        None => Err(
-            Diagnostic::error(format!("unbound proposition {}", app.name.text), app.span)
-                .with_note(format!("no proposition {} is defined", app.name.text)),
-        ),
+        None => Err(unknown_proposition(name, app.span, scope, true)),
+    }
+}
+
+fn is_parameter(name: &str, scope: &TypeScope) -> bool {
+    scope.parameters.iter().any(|ident| ident.text == name)
+}
+
+/// A name that is neither a parameter nor a defined proposition.
+fn unknown_proposition(name: &str, span: Span, scope: &TypeScope, applied: bool) -> Diagnostic {
+    let diag = Diagnostic::error(format!("cannot find proposition `{name}`"), span);
+
+    if scope.defining == Some(name) {
+        return diag
+            .with_primary_label("a proposition cannot refer to itself")
+            .with_note("propositions are expanded eagerly, so they cannot be recursive");
+    }
+
+    if applied {
+        // A parameter can't take arguments, so suggesting one would be wrong.
+        return diag.with_primary_label("not defined").with_note(format!(
+            "propositions must be defined before they are used: `proposition {name} ... := ...`"
+        ));
+    }
+
+    let mut diag = diag
+        .with_primary_label("not a parameter or a defined proposition")
+        .with_note(format!(
+            "to make `{name}` an arbitrary proposition, add it to the parameter list"
+        ));
+    if !scope.parameters.is_empty() {
+        let in_scope: Vec<String> = scope
+            .parameters
+            .iter()
+            .map(|ident| format!("`{}`", ident.text))
+            .collect();
+        diag = diag.with_note(format!("parameters in scope: {}", in_scope.join(", ")));
+    }
+    diag
+}
+
+/// A proposition was given the wrong number of arguments.
+fn alias_arity_error(
+    name: &str,
+    scheme: &kernel::Scheme,
+    mismatch: kernel::ArityMismatch,
+    span: Span,
+) -> Diagnostic {
+    let kernel::ArityMismatch { expected, found } = mismatch;
+    let message = if expected == 0 {
+        format!("proposition `{name}` takes no arguments")
+    } else {
+        format!(
+            "proposition `{name}` takes {} but {found} {} supplied",
+            kernel::count(expected, "argument"),
+            kernel::was_were(found)
+        )
+    };
+    let diag = Diagnostic::error(message, span)
+        .with_primary_label(format!("expected {}", kernel::count(expected, "argument")));
+    if expected == 0 {
+        diag
+    } else {
+        diag.with_note(format!(
+            "`{name}` is defined with parameters {}",
+            kernel::quoted_list(scheme.params())
+        ))
     }
 }
 
@@ -135,19 +211,17 @@ fn lower_type_false(_: &surface::ast::False, _: &TypeScope) -> Result<kernel::Ty
 }
 
 fn lower_type_atom(atom: &surface::ast::Atom, scope: &TypeScope) -> Result<kernel::Type> {
-    let name = atom.name.text.clone();
-    let found = scope.parameters.iter().any(|ident| ident.text == name);
+    let name = &atom.name.text;
 
-    if found {
-        Ok(kernel::Type::Atom { name })
-    } else {
-        match scope.aliases.get(&atom.name.text) {
-            Some(scheme) => scheme.instantiate(atom.span, &[]),
-            None => Err(
-                Diagnostic::error(format!("unbound proposition {}", name), atom.span)
-                    .with_note(format!("try adding {} as a type parameter", name)),
-            ),
-        }
+    if is_parameter(name, scope) {
+        return Ok(kernel::Type::Atom { name: name.clone() });
+    }
+
+    match scope.aliases.get(name) {
+        Some(scheme) => scheme
+            .instantiate(&[])
+            .map_err(|mismatch| alias_arity_error(name, scheme, mismatch, atom.span)),
+        None => Err(unknown_proposition(name, atom.span, scope, false)),
     }
 }
 
@@ -303,6 +377,7 @@ mod tests {
                     let scope = TypeScope {
                         parameters: &axiom.parameters,
                         aliases: &aliases,
+                        defining: None,
                     };
                     lower_type_parameters(&axiom.parameters)?;
                     lower_type(&axiom.typ, &scope)?;
@@ -311,6 +386,7 @@ mod tests {
                     let scope = TypeScope {
                         parameters: &theorem.parameters,
                         aliases: &aliases,
+                        defining: None,
                     };
                     lower_type_parameters(&theorem.parameters)?;
                     let typ = lower_type(&theorem.typ, &scope)?;
@@ -321,6 +397,7 @@ mod tests {
                     let scope = TypeScope {
                         parameters: &proposition.parameters,
                         aliases: &aliases,
+                        defining: Some(&proposition.name.text),
                     };
                     let parameters = lower_type_parameters(&proposition.parameters)?;
                     let typ = lower_type(&proposition.typ, &scope)?;
@@ -361,7 +438,10 @@ mod tests {
     }
 
     fn unbound(name: &str) -> (String, String) {
-        (format!("unbound proposition {name}"), name.to_string())
+        (
+            format!("cannot find proposition `{name}`"),
+            name.to_string(),
+        )
     }
 
     const KNIGHTS_AND_KNAVES: &str = r#"
@@ -405,7 +485,7 @@ mod tests {
     fn test_duplicate_parameter() {
         let source = "theorem t A B A : A := x.";
         let diag = lower_module(source).map(|_| ()).unwrap_err();
-        assert_eq!(diag.message, "duplicate parameter A");
+        assert_eq!(diag.message, "parameter `A` is declared more than once");
         // The primary label is on the second `A`, the secondary on the first.
         assert_eq!(diag.labels[0].span.start, source.find("A : ").unwrap());
         assert_eq!(diag.labels[1].span.start, source.find("A B").unwrap());
@@ -490,7 +570,7 @@ mod tests {
         assert_eq!(
             lower_error(&too_many),
             (
-                "expected 1 type argument but got 2".to_string(),
+                "proposition `Knave` takes 1 argument but 2 were supplied".to_string(),
                 "Knave A B".to_string()
             )
         );
@@ -499,7 +579,7 @@ mod tests {
         assert_eq!(
             lower_error(&bare),
             (
-                "expected 1 type argument but got 0".to_string(),
+                "proposition `Knave` takes 1 argument but 0 were supplied".to_string(),
                 "Knave".to_string()
             )
         );
@@ -508,7 +588,7 @@ mod tests {
         assert_eq!(
             lower_error(nullary_applied),
             (
-                "expected 0 type arguments but got 1".to_string(),
+                "proposition `Top` takes no arguments".to_string(),
                 "Top A".to_string()
             )
         );
@@ -519,7 +599,7 @@ mod tests {
         assert_eq!(
             lower_error("theorem t A B : A B := x."),
             (
-                "A is a parameter and takes no arguments".to_string(),
+                "parameter `A` cannot be applied to arguments".to_string(),
                 "A B".to_string()
             )
         );
@@ -529,7 +609,7 @@ mod tests {
     fn test_unbound_applied_name() {
         assert_eq!(
             lower_error("theorem t A : F A := x."),
-            ("unbound proposition F".to_string(), "F A".to_string())
+            ("cannot find proposition `F`".to_string(), "F A".to_string())
         );
     }
 
@@ -539,7 +619,7 @@ mod tests {
         assert_eq!(
             lower_error(source),
             (
-                "unbound proposition Knave".to_string(),
+                "cannot find proposition `Knave`".to_string(),
                 "Knave A".to_string()
             )
         );
@@ -549,8 +629,52 @@ mod tests {
     fn test_alias_cannot_refer_to_itself() {
         assert_eq!(
             lower_error("proposition K A := K A."),
-            ("unbound proposition K".to_string(), "K A".to_string())
+            ("cannot find proposition `K`".to_string(), "K A".to_string())
         );
         assert_eq!(lower_error("proposition K := not K."), unbound("K"));
+    }
+
+    fn lower_notes(source: &str) -> Vec<String> {
+        lower_module(source).map(|_| ()).unwrap_err().notes
+    }
+
+    #[test]
+    fn test_unknown_proposition_notes() {
+        assert_eq!(
+            lower_notes("theorem t A C : A -> B := x."),
+            vec![
+                "to make `B` an arbitrary proposition, add it to the parameter list",
+                "parameters in scope: `A`, `C`",
+            ]
+        );
+        // Nothing in scope: no list.
+        assert_eq!(lower_notes("theorem t : B := x.").len(), 1);
+        // An applied name can't be a parameter, so don't suggest adding one.
+        assert_eq!(
+            lower_notes("theorem t A : F A := x."),
+            vec!["propositions must be defined before they are used: `proposition F ... := ...`"]
+        );
+        assert_eq!(
+            lower_notes("proposition K A := not K A."),
+            vec!["propositions are expanded eagerly, so they cannot be recursive"]
+        );
+    }
+
+    #[test]
+    fn test_applied_parameter_hiding_alias() {
+        let source = format!("{KNIGHTS_AND_KNAVES}\ntheorem t Knave A : Knave A := x.");
+        assert_eq!(
+            lower_notes(&source),
+            vec!["the parameter `Knave` hides the proposition `Knave` defined earlier"]
+        );
+    }
+
+    #[test]
+    fn test_arity_notes() {
+        let source = format!("{KNIGHTS_AND_KNAVES}\ntheorem t A : Statement A := x.");
+        assert_eq!(
+            lower_notes(&source),
+            vec!["`Statement` is defined with parameters `A`, `S`"]
+        );
     }
 }

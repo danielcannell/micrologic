@@ -106,52 +106,61 @@ impl Type {
         }
     }
 
+    /// Print in surface syntax, recovering the sugar that lowering removed, so that messages
+    /// show `not A` rather than `A -> False`. Aliases can't be recovered: they are fully expanded.
+    ///
+    /// Precedence levels match the parser: `<->` (0) < `->` (1) < `or` (2) < `and` (3) < `not`
+    /// (4) < atoms (5). The binary operators are right-associative.
     fn fmt_at_prec(&self, f: &mut std::fmt::Formatter<'_>, prec: u8) -> std::fmt::Result {
         let this_prec = match self {
-            Type::Atom { .. } => 2,
+            _ if self.as_true() => 5,
+            _ if self.as_equiv().is_some() => 0,
+            _ if self.as_not().is_some() => 4,
+            Type::Atom { .. } | Type::False => 5,
             Type::Lambda { .. } => 1,
-            Type::Pair { .. } => 1,
-            Type::Either { .. } => 1,
-            Type::False => 2,
+            Type::Either { .. } => 2,
+            Type::Pair { .. } => 3,
         };
 
         if this_prec < prec {
             write!(f, "(")?;
         }
 
-        match self {
-            Type::Atom { name } => write!(f, "{}", name)?,
-
-            Type::Lambda {
-                argument_type,
-                result_type,
-            } => {
-                argument_type.fmt_at_prec(f, this_prec + 1)?;
-                write!(f, " -> ")?;
-                result_type.fmt_at_prec(f, this_prec)?;
+        if self.as_true() {
+            write!(f, "True")?;
+        } else if let Some((left, right)) = self.as_equiv() {
+            left.fmt_at_prec(f, this_prec + 1)?;
+            write!(f, " <-> ")?;
+            right.fmt_at_prec(f, this_prec)?;
+        } else if let Some(operand) = self.as_not() {
+            write!(f, "not ")?;
+            operand.fmt_at_prec(f, this_prec)?;
+        } else {
+            match self {
+                Type::Atom { name } => write!(f, "{}", name)?,
+                Type::False => write!(f, "False")?,
+                Type::Lambda {
+                    argument_type: left,
+                    result_type: right,
+                }
+                | Type::Either {
+                    left_type: left,
+                    right_type: right,
+                }
+                | Type::Pair {
+                    left_type: left,
+                    right_type: right,
+                } => {
+                    let operator = match self {
+                        Type::Lambda { .. } => "->",
+                        Type::Either { .. } => "or",
+                        _ => "and",
+                    };
+                    left.fmt_at_prec(f, this_prec + 1)?;
+                    write!(f, " {operator} ")?;
+                    right.fmt_at_prec(f, this_prec)?;
+                }
             }
-
-            Type::Pair {
-                left_type,
-                right_type,
-            } => {
-                write!(f, "Pair ")?;
-                left_type.fmt_at_prec(f, this_prec + 1)?;
-                write!(f, " ")?;
-                right_type.fmt_at_prec(f, this_prec + 1)?;
-            }
-
-            Type::Either {
-                left_type,
-                right_type,
-            } => {
-                write!(f, "Either ")?;
-                left_type.fmt_at_prec(f, this_prec + 1)?;
-                write!(f, " ")?;
-                right_type.fmt_at_prec(f, this_prec + 1)?;
-            }
-
-            Type::False => write!(f, "false")?,
         }
 
         if this_prec < prec {
@@ -159,6 +168,50 @@ impl Type {
         }
 
         Ok(())
+    }
+
+    /// `False -> False`, which lowering produces for `True`.
+    fn as_true(&self) -> bool {
+        matches!(
+            self,
+            Type::Lambda { argument_type, result_type }
+                if **argument_type == Type::False && **result_type == Type::False
+        )
+    }
+
+    /// `A -> False`, which lowering produces for `not A`.
+    fn as_not(&self) -> Option<&Type> {
+        match self {
+            Type::Lambda {
+                argument_type,
+                result_type,
+            } if **result_type == Type::False => Some(argument_type),
+            _ => None,
+        }
+    }
+
+    /// `(A -> B) and (B -> A)`, which lowering produces for `A <-> B`.
+    fn as_equiv(&self) -> Option<(&Type, &Type)> {
+        let Type::Pair {
+            left_type,
+            right_type,
+        } = self
+        else {
+            return None;
+        };
+        match (&**left_type, &**right_type) {
+            (
+                Type::Lambda {
+                    argument_type: a,
+                    result_type: b,
+                },
+                Type::Lambda {
+                    argument_type: b2,
+                    result_type: a2,
+                },
+            ) if a == a2 && b == b2 => Some((a, b)),
+            _ => None,
+        }
     }
 }
 
@@ -207,31 +260,56 @@ impl Scheme {
         }
     }
 
-    pub fn instantiate(&self, at: Span, type_arguments: &[Type]) -> Result<Type> {
-        // Check the correct number of type arguments have been provided.
+    /// The names of the parameters, in declaration order.
+    pub fn params(&self) -> &[String] {
+        &self.params
+    }
+
+    /// Substitute `type_arguments` for the parameters, simultaneously.
+    pub fn instantiate(&self, type_arguments: &[Type]) -> std::result::Result<Type, ArityMismatch> {
         if type_arguments.len() != self.params.len() {
-            return Err(Diagnostic::error(
-                format!(
-                    "expected {} type argument{} but got {}",
-                    self.params.len(),
-                    if self.params.len() != 1 { "s" } else { "" },
-                    type_arguments.len()
-                ),
-                at,
-            ));
+            return Err(ArityMismatch {
+                expected: self.params.len(),
+                found: type_arguments.len(),
+            });
         }
 
-        // Substitute the type parameters with the provided types
         let type_arguments: HashMap<&str, &Type> = self
             .params
             .iter()
             .map(|name| name.as_str())
             .zip(type_arguments.iter())
             .collect();
-        let substituted_type = self.typ.substitute(&type_arguments);
-
-        Ok(substituted_type)
+        Ok(self.typ.substitute(&type_arguments))
     }
+}
+
+/// A scheme was instantiated with the wrong number of arguments. Callers turn this into a
+/// diagnostic, since only they know what was being instantiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArityMismatch {
+    pub expected: usize,
+    pub found: usize,
+}
+
+/// `count(1, "argument")` is "1 argument", `count(0, "argument")` is "no arguments".
+pub fn count(n: usize, noun: &str) -> String {
+    match n {
+        0 => format!("no {noun}s"),
+        1 => format!("1 {noun}"),
+        _ => format!("{n} {noun}s"),
+    }
+}
+
+/// `["A", "B"]` becomes "`A`, `B`".
+pub fn quoted_list(names: &[String]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+    quoted.join(", ")
+}
+
+/// "was" or "were", to agree with `count(n, ..)`.
+pub fn was_were(n: usize) -> &'static str {
+    if n == 1 { "was" } else { "were" }
 }
 
 #[derive(Debug, Clone)]
@@ -442,15 +520,18 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type> {
             name,
             type_arguments,
         } => {
-            let (scheme, binding_trust) = ctx
-                .lookup(name)
-                .ok_or_else(|| Diagnostic::error(format!("Unknown variable {}", name), *span))?;
+            let (scheme, binding_trust) = ctx.lookup(name).ok_or_else(|| {
+                Diagnostic::error(format!("cannot find `{name}` in this scope"), *span)
+                    .with_primary_label("not a hypothesis, theorem or axiom")
+            })?;
 
             // Referring to an admitted theorem taints this proof too.
             trust.admit(binding_trust);
 
             // Substitute type arguments for type parameters
-            scheme.instantiate(*span, type_arguments)
+            scheme
+                .instantiate(type_arguments)
+                .map_err(|mismatch| type_arity_error(name, scheme, mismatch, *span))
         }
 
         Term::Lambda {
@@ -491,20 +572,31 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type> {
                 } else {
                     Err(Diagnostic::error(
                         format!(
-                            "Incorrect argument type in application: expected {}, but got {}",
-                            argument_type, argument_type_inferred
+                            "mismatched argument: expected `{argument_type}`, found `{argument_type_inferred}`"
                         ),
                         argument.span(),
+                    )
+                    .with_primary_label(format!("this has type `{argument_type_inferred}`"))
+                    .with_label(
+                        function.span(),
+                        format!(
+                            "this has type `{}`",
+                            Type::Lambda {
+                                argument_type,
+                                result_type
+                            }
+                        ),
                     ))
                 }
             } else {
                 Err(Diagnostic::error(
-                    format!(
-                        "Incorrect function type in application: expected function, but got {}",
-                        function_type_inferred
-                    ),
+                    format!("cannot apply a proof of `{function_type_inferred}` to an argument"),
                     function.span(),
+                )
+                .with_primary_label(format!(
+                    "this has type `{function_type_inferred}`, which is not an implication"
                 ))
+                .with_label(argument.span(), "argument supplied here"))
             }
         }
 
@@ -519,18 +611,18 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type> {
 
         Term::Fst { span: _, pair } => match infer(ctx, pair, trust)? {
             Type::Pair { left_type, .. } => Ok(*left_type),
-            other => Err(Diagnostic::error(
-                format!("Incorrect type in fst: expected Pair but got {}", other),
-                pair.span(),
-            )),
+            other => Err(
+                Diagnostic::error("`fst` expects a proof of a conjunction", pair.span())
+                    .with_primary_label(format!("this has type `{other}`")),
+            ),
         },
 
         Term::Snd { span: _, pair } => match infer(ctx, pair, trust)? {
             Type::Pair { right_type, .. } => Ok(*right_type),
-            other => Err(Diagnostic::error(
-                format!("Incorrect type in snd: expected Pair but got {}", other),
-                pair.span(),
-            )),
+            other => Err(
+                Diagnostic::error("`snd` expects a proof of a conjunction", pair.span())
+                    .with_primary_label(format!("this has type `{other}`")),
+            ),
         },
 
         Term::Inl {
@@ -558,7 +650,7 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type> {
         }
 
         Term::Case {
-            span,
+            span: _,
             either,
             left_name,
             left_body,
@@ -573,12 +665,10 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type> {
                 } => (left_type, right_type),
                 other => {
                     return Err(Diagnostic::error(
-                        format!(
-                            "Incorrect type in case value: expected Either, but got {}",
-                            other
-                        ),
+                        "`case` expects a proof of a disjunction",
                         either.span(),
-                    ));
+                    )
+                    .with_primary_label(format!("this has type `{other}`")));
                 }
             };
 
@@ -597,13 +687,16 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type> {
             if left_body_type_inferred == right_body_type_inferred {
                 Ok(left_body_type_inferred)
             } else {
-                Err(Diagnostic::error(
-                    format!(
-                        "Mismatched branch types in case: left branch has type {}, but right branch has type {}",
-                        left_body_type_inferred, right_body_type_inferred
-                    ),
-                    *span,
-                ))
+                Err(
+                    Diagnostic::error("`case` branches have different types", right_body.span())
+                        .with_primary_label(format!(
+                            "this branch has type `{right_body_type_inferred}`"
+                        ))
+                        .with_label(
+                            left_body.span(),
+                            format!("but this branch has type `{left_body_type_inferred}`"),
+                        ),
+                )
             }
         }
 
@@ -615,13 +708,10 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type> {
             let body_type = infer(ctx, body, trust)?;
             match body_type {
                 Type::False => Ok(goal_type.clone()),
-                other => Err(Diagnostic::error(
-                    format!(
-                        "Incorrect type in absurd: expected False, but got {}",
-                        other
-                    ),
-                    body.span(),
-                )),
+                other => Err(
+                    Diagnostic::error("`absurd` expects a proof of `False`", body.span())
+                        .with_primary_label(format!("this has type `{other}`")),
+                ),
             }
         }
 
@@ -633,19 +723,143 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type> {
     }
 }
 
-pub fn check(ctx: &Context, term: &Term, scheme: &Scheme) -> Result<Trust> {
-    let mut trust = Trust::Proved;
-    let term_type_inferred = infer(ctx, term, &mut trust)?;
-    if term_type_inferred != scheme.typ {
-        return Err(Diagnostic::error(
+/// A `Var` was given the wrong number of type arguments.
+fn type_arity_error(name: &str, scheme: &Scheme, mismatch: ArityMismatch, at: Span) -> Diagnostic {
+    let ArityMismatch { expected, found } = mismatch;
+    let diag = if expected == 0 {
+        Diagnostic::error(format!("`{name}` takes no type arguments"), at)
+            .with_primary_label(format!("{} supplied", count(found, "type argument")))
+    } else {
+        Diagnostic::error(
             format!(
-                "Incorrect type: expected {} but got {}",
-                scheme.typ, term_type_inferred
+                "`{name}` takes {} but {found} {} supplied",
+                count(expected, "type argument"),
+                was_were(found)
             ),
-            term.span(),
-        ));
+            at,
+        )
+        .with_primary_label(format!("expected {}", count(expected, "type argument")))
+    };
+
+    if expected == 0 {
+        diag
+    } else {
+        let placeholders: Vec<String> = scheme.params().iter().map(|p| format!("[{p}]")).collect();
+        diag.with_note(format!(
+            "`{name}` has type parameters {}; supply one type for each: `{name} {}`",
+            quoted_list(scheme.params()),
+            placeholders.join(" ")
+        ))
     }
+}
+
+/// Check that `term` proves `scheme`, whose statement is written at `statement`.
+///
+/// Returns whether the proof is complete or relies on a `trustme`.
+pub fn check(ctx: &Context, term: &Term, scheme: &Scheme, statement: Span) -> Result<Trust> {
+    let mut trust = Trust::Proved;
+    check_against(ctx, term, &scheme.typ, statement, &mut trust)?;
     Ok(trust)
+}
+
+/// Check `term` against an `expected` type.
+///
+/// This is equivalent to inferring the type and comparing it with `expected`, but pushes the
+/// expected type into lambdas, pairs and case branches so that a mismatch is reported at the
+/// innermost sub-term that is wrong, rather than at the whole proof. `statement` is where the
+/// expected type came from.
+fn check_against(
+    ctx: &Context,
+    term: &Term,
+    expected: &Type,
+    statement: Span,
+    trust: &mut Trust,
+) -> Result<()> {
+    match (term, expected) {
+        (
+            Term::Lambda {
+                span,
+                argument,
+                argument_type,
+                body,
+            },
+            Type::Lambda {
+                argument_type: expected_argument_type,
+                result_type: expected_result_type,
+            },
+        ) => {
+            if argument_type != &**expected_argument_type {
+                return Err(Diagnostic::error(
+                    format!("hypothesis `{argument}` has the wrong type"),
+                    *span,
+                )
+                .with_primary_label(format!(
+                    "`{argument}` is declared as `{argument_type}`, but `{expected_argument_type}` is expected"
+                ))
+                .with_label(statement, "expected because of this statement"));
+            }
+            let ctx = ctx.bind(
+                argument.clone(),
+                Scheme::new_monomorphic(argument_type.clone()),
+            );
+            check_against(&ctx, body, expected_result_type, statement, trust)
+        }
+
+        (
+            Term::Pair { left, right, .. },
+            Type::Pair {
+                left_type,
+                right_type,
+            },
+        ) => {
+            check_against(ctx, left, left_type, statement, trust)?;
+            check_against(ctx, right, right_type, statement, trust)
+        }
+
+        (
+            Term::Case {
+                either,
+                left_name,
+                left_body,
+                right_name,
+                right_body,
+                ..
+            },
+            _,
+        ) => {
+            let (left_type, right_type) = match infer(ctx, either, trust)? {
+                Type::Either {
+                    left_type,
+                    right_type,
+                } => (left_type, right_type),
+                other => {
+                    return Err(Diagnostic::error(
+                        "`case` expects a proof of a disjunction",
+                        either.span(),
+                    )
+                    .with_primary_label(format!("this has type `{other}`")));
+                }
+            };
+            let left_ctx = ctx.bind(left_name.clone(), Scheme::new_monomorphic(*left_type));
+            check_against(&left_ctx, left_body, expected, statement, trust)?;
+            let right_ctx = ctx.bind(right_name.clone(), Scheme::new_monomorphic(*right_type));
+            check_against(&right_ctx, right_body, expected, statement, trust)
+        }
+
+        _ => {
+            let inferred = infer(ctx, term, trust)?;
+            if inferred == *expected {
+                Ok(())
+            } else {
+                Err(Diagnostic::error(
+                    format!("mismatched types: expected `{expected}`, found `{inferred}`"),
+                    term.span(),
+                )
+                .with_primary_label(format!("this has type `{inferred}`"))
+                .with_label(statement, "expected because of this statement"))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -738,12 +952,62 @@ mod tests {
         }
     }
 
+    fn or(left_type: Type, right_type: Type) -> Type {
+        Type::Either {
+            left_type: Box::new(left_type),
+            right_type: Box::new(right_type),
+        }
+    }
+
+    fn not(typ: Type) -> Type {
+        arrow(typ, Type::False)
+    }
+
+    #[test]
+    fn test_display_uses_surface_syntax() {
+        let (a, b, c) = (atom("A"), atom("B"), atom("C"));
+        let cases = [
+            (Type::False, "False"),
+            (arrow(Type::False, Type::False), "True"),
+            (not(a.clone()), "not A"),
+            (not(not(a.clone())), "not not A"),
+            (not(and(a.clone(), b.clone())), "not (A and B)"),
+            (and(not(a.clone()), b.clone()), "not A and B"),
+            (arrow(a.clone(), arrow(b.clone(), c.clone())), "A -> B -> C"),
+            (
+                arrow(arrow(a.clone(), b.clone()), c.clone()),
+                "(A -> B) -> C",
+            ),
+            (or(and(a.clone(), b.clone()), c.clone()), "A and B or C"),
+            (and(or(a.clone(), b.clone()), c.clone()), "(A or B) and C"),
+            (and(a.clone(), and(b.clone(), c.clone())), "A and B and C"),
+            (and(and(a.clone(), b.clone()), c.clone()), "(A and B) and C"),
+            (
+                and(arrow(a.clone(), b.clone()), arrow(b.clone(), a.clone())),
+                "A <-> B",
+            ),
+            (
+                arrow(
+                    and(arrow(a.clone(), b.clone()), arrow(b.clone(), a.clone())),
+                    c.clone(),
+                ),
+                "(A <-> B) -> C",
+            ),
+            // Not an equivalence: the two implications don't mirror each other.
+            (
+                and(arrow(a.clone(), b.clone()), arrow(a.clone(), b.clone())),
+                "(A -> B) and (A -> B)",
+            ),
+        ];
+        for (typ, expected) in cases {
+            assert_eq!(typ.to_string(), expected);
+        }
+    }
+
     #[test]
     fn test_instantiate_is_simultaneous() {
         // Substituting A := B then B := A one at a time would give `A and A -> A and A`.
-        let instantiated = swap_scheme()
-            .instantiate(NO_SPAN, &[atom("B"), atom("A")])
-            .unwrap();
+        let instantiated = swap_scheme().instantiate(&[atom("B"), atom("A")]).unwrap();
         assert_eq!(
             instantiated,
             arrow(and(atom("B"), atom("A")), and(atom("A"), atom("B")))
@@ -753,31 +1017,49 @@ mod tests {
     #[test]
     fn test_instantiate_with_compound_type() {
         let a_to_a = arrow(atom("A"), atom("A"));
-        let instantiated = id_scheme().instantiate(NO_SPAN, &[a_to_a.clone()]).unwrap();
+        let instantiated = id_scheme().instantiate(&[a_to_a.clone()]).unwrap();
         assert_eq!(instantiated, arrow(a_to_a.clone(), a_to_a));
     }
 
     #[test]
     fn test_instantiate_monomorphic() {
         let typ = arrow(Type::False, Type::False);
-        let instantiated = scheme(&[], typ.clone()).instantiate(NO_SPAN, &[]).unwrap();
+        let instantiated = scheme(&[], typ.clone()).instantiate(&[]).unwrap();
         assert_eq!(instantiated, typ);
     }
 
     #[test]
     fn test_instantiate_rejects_wrong_arity() {
-        let too_few = id_scheme().instantiate(NO_SPAN, &[]).unwrap_err();
-        assert_eq!(too_few.message, "expected 1 type argument but got 0");
+        let too_few = id_scheme().instantiate(&[]).unwrap_err();
+        assert_eq!(
+            too_few,
+            ArityMismatch {
+                expected: 1,
+                found: 0
+            }
+        );
 
         let too_many = id_scheme()
-            .instantiate(NO_SPAN, &[atom("A"), atom("B")])
+            .instantiate(&[atom("A"), atom("B")])
             .unwrap_err();
-        assert_eq!(too_many.message, "expected 1 type argument but got 2");
+        assert_eq!(
+            too_many,
+            ArityMismatch {
+                expected: 1,
+                found: 2
+            }
+        );
 
         let for_mono = scheme(&[], Type::False)
-            .instantiate(NO_SPAN, &[atom("A")])
+            .instantiate(&[atom("A")])
             .unwrap_err();
-        assert_eq!(for_mono.message, "expected 0 type arguments but got 1");
+        assert_eq!(
+            for_mono,
+            ArityMismatch {
+                expected: 0,
+                found: 1
+            }
+        );
     }
 
     #[test]
@@ -803,7 +1085,7 @@ mod tests {
             arrow(and(atom("B"), atom("A")), and(atom("A"), atom("B"))),
         );
         let body = var("swap", vec![atom("B"), atom("A")]);
-        assert_eq!(check(&ctx, &body, &goal).unwrap(), Trust::Proved);
+        assert_eq!(check(&ctx, &body, &goal, NO_SPAN).unwrap(), Trust::Proved);
     }
 
     #[test]
@@ -813,7 +1095,7 @@ mod tests {
         let a_to_a = arrow(atom("A"), atom("A"));
         let goal = scheme(&["A"], arrow(a_to_a.clone(), a_to_a.clone()));
         let body = var("id", vec![a_to_a]);
-        assert_eq!(check(&ctx, &body, &goal).unwrap(), Trust::Proved);
+        assert_eq!(check(&ctx, &body, &goal, NO_SPAN).unwrap(), Trust::Proved);
     }
 
     #[test]
@@ -822,8 +1104,8 @@ mod tests {
         let goal = scheme(&["A"], arrow(atom("A"), atom("A")));
         let body = var("id", vec![]);
         assert_eq!(
-            error_message(check(&ctx, &body, &goal)),
-            "expected 1 type argument but got 0"
+            error_message(check(&ctx, &body, &goal, NO_SPAN)),
+            "`id` takes 1 type argument but 0 were supplied"
         );
     }
 
@@ -833,8 +1115,8 @@ mod tests {
         let goal = scheme(&["A"], arrow(atom("A"), atom("A")));
         let body = lam("x", atom("A"), var("x", vec![atom("A")]));
         assert_eq!(
-            error_message(check(&Context::new(), &body, &goal)),
-            "expected 0 type arguments but got 1"
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "`x` takes no type arguments"
         );
     }
 
@@ -844,7 +1126,7 @@ mod tests {
         let ctx = Context::new().bind("id".to_string(), id_scheme());
         let goal = scheme(&["A"], arrow(atom("A"), atom("A")));
         let body = lam("id", atom("A"), var("id", vec![]));
-        assert_eq!(check(&ctx, &body, &goal).unwrap(), Trust::Proved);
+        assert_eq!(check(&ctx, &body, &goal, NO_SPAN).unwrap(), Trust::Proved);
     }
 
     #[test]
@@ -852,7 +1134,7 @@ mod tests {
         // theorem bad A B : A -> B := fun (x : A) => x
         let goal = scheme(&["A", "B"], arrow(atom("A"), atom("B")));
         let body = lam("x", atom("A"), var("x", vec![]));
-        assert!(check(&Context::new(), &body, &goal).is_err());
+        assert!(check(&Context::new(), &body, &goal, NO_SPAN).is_err());
     }
 
     #[test]
@@ -861,7 +1143,7 @@ mod tests {
         let ctx = Context::new().bind("id".to_string(), id_scheme());
         let goal = scheme(&[], Type::False);
         let body = var("id", vec![Type::False]);
-        assert!(check(&ctx, &body, &goal).is_err());
+        assert!(check(&ctx, &body, &goal, NO_SPAN).is_err());
     }
 
     #[test]
@@ -870,11 +1152,11 @@ mod tests {
 
         // fun (x : A) => fst x
         let body = lam("x", atom("A"), fst(var("x", vec![])));
-        assert!(check(&Context::new(), &body, &goal).is_err());
+        assert!(check(&Context::new(), &body, &goal, NO_SPAN).is_err());
 
         // fun (x : A) => x x
         let body = lam("x", atom("A"), app(var("x", vec![]), var("x", vec![])));
-        assert!(check(&Context::new(), &body, &goal).is_err());
+        assert!(check(&Context::new(), &body, &goal, NO_SPAN).is_err());
 
         // fun (x : A) => absurd [A] x
         let body = lam(
@@ -886,15 +1168,15 @@ mod tests {
                 body: Box::new(var("x", vec![])),
             },
         );
-        assert!(check(&Context::new(), &body, &goal).is_err());
+        assert!(check(&Context::new(), &body, &goal, NO_SPAN).is_err());
     }
 
     #[test]
     fn test_unknown_variable() {
         let goal = scheme(&[], Type::False);
         assert_eq!(
-            error_message(check(&Context::new(), &var("nope", vec![]), &goal)),
-            "Unknown variable nope"
+            error_message(check(&Context::new(), &var("nope", vec![]), &goal, NO_SPAN)),
+            "cannot find `nope` in this scope"
         );
     }
 
@@ -902,7 +1184,7 @@ mod tests {
     fn test_trustme_is_admitted() {
         let goal = scheme(&[], Type::False);
         assert_eq!(
-            check(&Context::new(), &trustme(Type::False), &goal).unwrap(),
+            check(&Context::new(), &trustme(Type::False), &goal, NO_SPAN).unwrap(),
             Trust::Admitted
         );
     }
@@ -913,10 +1195,16 @@ mod tests {
         let body = var("id", vec![atom("A")]);
 
         let proved = Context::new().bind_with_trust("id".to_string(), id_scheme(), Trust::Proved);
-        assert_eq!(check(&proved, &body, &goal).unwrap(), Trust::Proved);
+        assert_eq!(
+            check(&proved, &body, &goal, NO_SPAN).unwrap(),
+            Trust::Proved
+        );
 
         let admitted =
             Context::new().bind_with_trust("id".to_string(), id_scheme(), Trust::Admitted);
-        assert_eq!(check(&admitted, &body, &goal).unwrap(), Trust::Admitted);
+        assert_eq!(
+            check(&admitted, &body, &goal, NO_SPAN).unwrap(),
+            Trust::Admitted
+        );
     }
 }
