@@ -4,7 +4,11 @@ proposition Knight A := A.
 proposition Knave A := not A.
 proposition Statement A S := (Knight A -> S) and (Knave A -> not S).
 
-theorem puzzle Alice Bob : Statement Alice (Knave Alice and Knave Bob) <-> (Knave Alice and Knight Bob) :=
+-- Puzzle 1
+--
+-- Alice says, "We are both knaves"
+
+theorem puzzle1 Alice Bob : Statement Alice (Knave Alice and Knave Bob) <-> (Knave Alice and Knight Bob) :=
     (
         fun (h : (Knight Alice -> (Knave Alice and Knave Bob)) and (Knave Alice -> not (Knave Alice and Knave Bob))) =>
             case excluded_middle [Alice] of
