@@ -8,6 +8,16 @@ theorem and_swap_curried A B : A -> B -> B and A := by
     exact b;
     exact a.
 
+theorem and_assoc_curried A B C : A -> B -> C -> (A and B) and C := by
+    intro a;
+    intro b;
+    intro c;
+    split;
+    split;
+    exact a;
+    exact b;
+    exact c.
+
 theorem or_intro A B : A -> B or A := by
     intro a;
     right;

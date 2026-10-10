@@ -1,6 +1,6 @@
 use crate::diagnostics::{Diagnostic, Result, Span};
 use crate::kernel;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct Script {
@@ -87,25 +87,41 @@ enum Partial {
 impl Partial {
     fn fill(self, solutions: &mut HashMap<GoalId, Partial>) -> kernel::Term {
         match self {
-            Partial::Hole { goal_id } => solutions.remove(&goal_id).expect("all goals should be solved before calling fill").fill(solutions),
+            Partial::Hole { goal_id } => solutions
+                .remove(&goal_id)
+                .expect("all goals should be solved before calling fill")
+                .fill(solutions),
             Partial::Term { term } => term,
-            Partial::Lambda { span, argument, argument_type, body} => kernel::Term::Lambda {
+            Partial::Lambda {
                 span,
                 argument,
                 argument_type,
-                body: Box::new(body.fill(solutions))
+                body,
+            } => kernel::Term::Lambda {
+                span,
+                argument,
+                argument_type,
+                body: Box::new(body.fill(solutions)),
             },
             Partial::Pair { span, left, right } => kernel::Term::Pair {
                 span,
                 left: Box::new(left.fill(solutions)),
-                right: Box::new(right.fill(solutions))
+                right: Box::new(right.fill(solutions)),
             },
-            Partial::Inl { span, right_type, left } => kernel::Term::Inl {
+            Partial::Inl {
+                span,
+                right_type,
+                left,
+            } => kernel::Term::Inl {
                 span,
                 right_type,
                 left: Box::new(left.fill(solutions)),
             },
-            Partial::Inr { span, left_type, right } => kernel::Term::Inr {
+            Partial::Inr {
+                span,
+                left_type,
+                right,
+            } => kernel::Term::Inr {
                 span,
                 left_type,
                 right: Box::new(right.fill(solutions)),
@@ -116,22 +132,24 @@ impl Partial {
 
 #[derive(Debug, Clone)]
 struct ProofState {
-    goals: VecDeque<Goal>,
+    goals: Vec<Goal>,
     solutions: HashMap<GoalId, Partial>,
     next_goal_id: u64,
 }
 
 impl ProofState {
-    fn add_goal(&mut self, locals: Vec<Local>, target: kernel::Type) -> GoalId {
+    /// Push a goal onto the stack of goals
+    fn push_goal(&mut self, locals: Vec<Local>, target: kernel::Type) -> GoalId {
         let id = GoalId(self.next_goal_id);
         self.next_goal_id += 1;
         let goal = Goal { id, locals, target };
-        self.goals.push_back(goal);
+        self.goals.push(goal);
         id
     }
 
+    /// Pop the most recently added goal
     fn pop_goal(&mut self) -> Option<Goal> {
-        self.goals.pop_front()
+        self.goals.pop()
     }
 
     fn add_solution(&mut self, goal_id: GoalId, solution: Partial) {
@@ -148,17 +166,17 @@ impl ProofState {
 /// This works backwards from the target type, building up a kernel term of that type sub-term by
 /// sub-term. The script is a list of tactics, and each tactic fills in further sub-terms.
 pub fn elaborate(
-    ctx: &kernel::Context,
+    _ctx: &kernel::Context,
     script: &Script,
     target: &kernel::Type,
 ) -> Result<kernel::Term> {
     let mut proof_state = ProofState {
-        goals: VecDeque::new(),
+        goals: Vec::new(),
         solutions: HashMap::new(),
         next_goal_id: 0,
     };
 
-    let root_goal_id = proof_state.add_goal(Vec::new(), target.clone());
+    let root_goal_id = proof_state.push_goal(Vec::new(), target.clone());
 
     for tactic in &script.tactics {
         let goal = match proof_state.pop_goal() {
@@ -183,7 +201,7 @@ pub fn elaborate(
                         typ: (*argument_type).clone(),
                     });
 
-                    let new_goal_id = proof_state.add_goal(new_locals, *result_type);
+                    let new_goal_id = proof_state.push_goal(new_locals, *result_type);
 
                     let solution = Partial::Lambda {
                         span: *span,
@@ -202,19 +220,29 @@ pub fn elaborate(
                     ));
                 }
             }
-            Tactic::Exact { span, term } => {
+            Tactic::Exact { span: _, term } => {
                 let solution = Partial::Term { term: term.clone() };
                 proof_state.add_solution(goal.id, solution);
             }
             Tactic::Split { span } => {
-                if let kernel::Type::Pair { left_type, right_type } = goal.target {
-                    let new_goal_id_left = proof_state.add_goal(goal.locals.clone(), *left_type);
-                    let new_goal_id_right = proof_state.add_goal(goal.locals, *right_type);
+                if let kernel::Type::Pair {
+                    left_type,
+                    right_type,
+                } = goal.target
+                {
+                    // Push the right goal first, so that we work on the left goal before the right
+                    // goal
+                    let new_goal_id_right = proof_state.push_goal(goal.locals.clone(), *right_type);
+                    let new_goal_id_left = proof_state.push_goal(goal.locals.clone(), *left_type);
 
                     let solution = Partial::Pair {
                         span: *span,
-                        left: Box::new(Partial::Hole { goal_id: new_goal_id_left }),
-                        right: Box::new(Partial::Hole { goal_id: new_goal_id_right }),
+                        left: Box::new(Partial::Hole {
+                            goal_id: new_goal_id_left,
+                        }),
+                        right: Box::new(Partial::Hole {
+                            goal_id: new_goal_id_right,
+                        }),
                     };
 
                     proof_state.add_solution(goal.id, solution);
@@ -222,17 +250,23 @@ pub fn elaborate(
                     return Err(Diagnostic::error(
                         "`split` needs a goal of the form `A and B`",
                         *span,
-                    ))
+                    ));
                 }
             }
             Tactic::Left { span } => {
-                if let kernel::Type::Either { left_type, right_type } = goal.target {
-                    let new_goal_id = proof_state.add_goal(goal.locals.clone(), *left_type);
+                if let kernel::Type::Either {
+                    left_type,
+                    right_type,
+                } = goal.target
+                {
+                    let new_goal_id = proof_state.push_goal(goal.locals.clone(), *left_type);
 
                     let solution = Partial::Inl {
                         span: *span,
                         right_type: *right_type,
-                        left: Box::new(Partial::Hole { goal_id: new_goal_id }),
+                        left: Box::new(Partial::Hole {
+                            goal_id: new_goal_id,
+                        }),
                     };
 
                     proof_state.add_solution(goal.id, solution);
@@ -240,17 +274,23 @@ pub fn elaborate(
                     return Err(Diagnostic::error(
                         "`left` needs a term of type `A` or `B`",
                         *span,
-                    ))
+                    ));
                 }
             }
             Tactic::Right { span } => {
-                if let kernel::Type::Either { left_type, right_type } = goal.target {
-                    let new_goal_id = proof_state.add_goal(goal.locals.clone(), *right_type);
+                if let kernel::Type::Either {
+                    left_type,
+                    right_type,
+                } = goal.target
+                {
+                    let new_goal_id = proof_state.push_goal(goal.locals.clone(), *right_type);
 
                     let solution = Partial::Inr {
                         span: *span,
                         left_type: *left_type,
-                        right: Box::new(Partial::Hole { goal_id: new_goal_id }),
+                        right: Box::new(Partial::Hole {
+                            goal_id: new_goal_id,
+                        }),
                     };
 
                     proof_state.add_solution(goal.id, solution);
@@ -258,22 +298,54 @@ pub fn elaborate(
                     return Err(Diagnostic::error(
                         "`right` needs a term of type `A` or `B`",
                         *span,
-                    ))
+                    ));
                 }
             }
             Tactic::Assumption { span } => {
-                todo!()
+                let mut found = false;
+                let mut seen = HashSet::new();
+
+                for local in goal.locals.iter().rev() {
+                    // TODO: Nice error if we find only a shadowed local of the right type,
+                    // suggesting renaming
+                    if local.typ == goal.target && !seen.contains(&local.name) {
+                        let solution = Partial::Term {
+                            term: kernel::Term::Var {
+                                span: *span,
+                                name: local.name.clone(),
+                                type_arguments: Vec::new(),
+                            },
+                        };
+                        proof_state.add_solution(goal.id, solution);
+                        found = true;
+                        break;
+                    }
+
+                    seen.insert(local.name.clone());
+                }
+
+                if !found {
+                    return Err(Diagnostic::error("no matching hypothesis found", *span));
+                }
             }
             Tactic::Admit { span } => {
-                let solution = Partial::Term { term: kernel::Term::TrustMe { span: *span, goal_type: goal.target } };
+                let solution = Partial::Term {
+                    term: kernel::Term::TrustMe {
+                        span: *span,
+                        goal_type: goal.target,
+                    },
+                };
                 proof_state.add_solution(goal.id, solution);
             }
         }
     }
 
     if !proof_state.goals.is_empty() {
-        return Err(Diagnostic::error("unresolved goals", script.span))
+        return Err(Diagnostic::error("unresolved goals", script.span));
     }
 
-    Ok(Partial::Hole { goal_id: root_goal_id }.fill(&mut proof_state.solutions))
+    Ok(Partial::Hole {
+        goal_id: root_goal_id,
+    }
+    .fill(&mut proof_state.solutions))
 }
