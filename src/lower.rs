@@ -1,6 +1,6 @@
 use crate::diagnostics::{Diagnostic, Result, Span};
-use crate::kernel;
 use crate::surface;
+use crate::{kernel, tactic};
 use std::collections::HashMap;
 
 pub struct TypeScope<'a> {
@@ -358,6 +358,70 @@ fn lower_term_trustme(trustme: &surface::ast::TrustMe, scope: &TypeScope) -> Res
     })
 }
 
+pub fn lower_script(script: &surface::ast::Script, scope: &TypeScope) -> Result<tactic::Script> {
+    let mut tactics = Vec::new();
+
+    for tactic in &script.tactics {
+        tactics.push(lower_tactic(tactic, scope)?);
+    }
+
+    Ok(tactic::Script {
+        span: script.span,
+        tactics,
+    })
+}
+
+fn lower_tactic(tactic: &surface::ast::Tactic, scope: &TypeScope) -> Result<tactic::Tactic> {
+    match tactic {
+        surface::ast::Tactic::Intro(intro) => lower_intro(intro, scope),
+        surface::ast::Tactic::Exact(exact) => lower_exact(exact, scope),
+        surface::ast::Tactic::Split(split) => lower_split(split, scope),
+        surface::ast::Tactic::Left(left) => lower_left(left, scope),
+        surface::ast::Tactic::Right(right) => lower_right(right, scope),
+        surface::ast::Tactic::Assumption(assumption) => lower_assumption(assumption, scope),
+        surface::ast::Tactic::Admit(admit) => lower_admit(admit, scope),
+    }
+}
+
+fn lower_intro(intro: &surface::ast::Intro, scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Intro {
+        span: intro.span,
+        name: intro.name.text.clone(),
+    })
+}
+
+fn lower_exact(exact: &surface::ast::Exact, scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Exact {
+        span: exact.span,
+        term: lower_term(&exact.term, scope)?,
+    })
+}
+
+fn lower_split(split: &surface::ast::Split, scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Split { span: split.span })
+}
+
+fn lower_left(left: &surface::ast::Left, scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Left { span: left.span })
+}
+
+fn lower_right(right: &surface::ast::Right, scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Right { span: right.span })
+}
+
+fn lower_assumption(
+    assumption: &surface::ast::Assumption,
+    scope: &TypeScope,
+) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Assumption {
+        span: assumption.span,
+    })
+}
+
+fn lower_admit(admit: &surface::ast::Admit, scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Admit { span: admit.span })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,7 +454,11 @@ mod tests {
                     };
                     lower_type_parameters(&theorem.parameters)?;
                     let typ = lower_type(&theorem.typ, &scope)?;
-                    let body = lower_term(&theorem.body, &scope)?;
+                    let body = match &theorem.body {
+                        surface::ast::Body::Term(body) => body,
+                        _ => todo!(),
+                    };
+                    let body = lower_term(body, &scope)?;
                     last = Some((typ, body));
                 }
                 Item::Proposition(proposition) => {

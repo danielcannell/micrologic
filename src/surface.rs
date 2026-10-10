@@ -3,8 +3,12 @@
 // module      := item*
 // item        := axiom | theorem | proposition
 // axiom       := "axiom" IDENT IDENT* ':' type '.'
-// theorem     := "theorem" IDENT IDENT* ':' type ':=' term '.'
+// theorem     := "theorem" IDENT IDENT* ':' type ':=' theorem_body '.'
 // proposition := "proposition" IDENT IDENT* ':=' type '.'
+//
+// theorem_body := "by" script | term
+// script       := tactic (';' tactic)*
+// tactic       := "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit"
 //
 // type        := type_lambda ("<->" type)?
 // type_lambda := type_or ("->" type)?
@@ -68,7 +72,81 @@ pub mod ast {
         pub name: Ident,
         pub parameters: Vec<Ident>,
         pub typ: Type,
-        pub body: Term,
+        pub body: Body,
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum Body {
+        Term(Term),
+        Script(Script),
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Script {
+        pub span: Span,
+        pub tactics: Vec<Tactic>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum Tactic {
+        Intro(Intro),
+        Exact(Exact),
+        Split(Split),
+        Left(Left),
+        Right(Right),
+        Assumption(Assumption),
+        Admit(Admit),
+    }
+
+    impl Tactic {
+        pub fn span(&self) -> Span {
+            match self {
+                Tactic::Intro(intro) => intro.span,
+                Tactic::Exact(exact) => exact.span,
+                Tactic::Split(split) => split.span,
+                Tactic::Left(left) => left.span,
+                Tactic::Right(right) => right.span,
+                Tactic::Assumption(assumption) => assumption.span,
+                Tactic::Admit(admit) => admit.span,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Intro {
+        pub span: Span,
+        pub name: Ident,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Exact {
+        pub span: Span,
+        pub term: Term,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Split {
+        pub span: Span,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Left {
+        pub span: Span,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Right {
+        pub span: Span,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Assumption {
+        pub span: Span,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Admit {
+        pub span: Span,
     }
 
     /// `proposition name params : type .`
@@ -304,17 +382,21 @@ pub enum TokenKind {
     Snd,         // "snd"
     Absurd,      // "absurd"
     TrustMe,     // "trustme"
+    By,          // "by"
 
     // Delimiters
     LeftParen,    // '('
     RightParen,   // ')'
     LeftBracket,  // '['
     RightBracket, // ']'
+    LeftBrace,    // '{'
+    RightBrace,   // '}'
 
     // Punctuation
     Dot,         // '.'
     Bar,         // '|'
     Comma,       // ','
+    Semicolon,   // ';'
     Colon,       // ':'
     ColonEqual,  // ':='
     Equal,       // '='
@@ -379,9 +461,12 @@ impl<'source> Lexer<'source> {
                 ')' => TokenKind::RightParen,
                 '[' => TokenKind::LeftBracket,
                 ']' => TokenKind::RightBracket,
+                '{' => TokenKind::LeftBrace,
+                '}' => TokenKind::RightBrace,
                 '.' => TokenKind::Dot,
                 '|' => TokenKind::Bar,
                 ',' => TokenKind::Comma,
+                ';' => TokenKind::Semicolon,
 
                 // Multi-character tokens
                 ':' => {
@@ -443,6 +528,7 @@ impl<'source> Lexer<'source> {
                         "snd" => TokenKind::Snd,
                         "absurd" => TokenKind::Absurd,
                         "trustme" => TokenKind::TrustMe,
+                        "by" => TokenKind::By,
                         _ => TokenKind::Ident,
                     }
                 }
@@ -575,7 +661,7 @@ impl<'source> Parser<'source> {
         })
     }
 
-    // theorem := "theorem" IDENT IDENT* ':' type ':=' term '.'
+    // theorem := "theorem" IDENT IDENT* ':' type ':=' theorem_body '.'
     fn parse_theorem(&mut self) -> Result<ast::Theorem> {
         let start = self.current.span;
         self.expect_token(TokenKind::Theorem)?;
@@ -587,7 +673,7 @@ impl<'source> Parser<'source> {
         self.expect_token(TokenKind::Colon)?;
         let typ = self.parse_type()?;
         self.expect_token(TokenKind::ColonEqual)?;
-        let body = self.parse_term()?;
+        let body = self.parse_theorem_body()?;
         self.expect_token(TokenKind::Dot)?;
         Ok(ast::Theorem {
             span: self.span_from(start),
@@ -598,7 +684,83 @@ impl<'source> Parser<'source> {
         })
     }
 
-    // proposition := "proposition" IDENT IDENT* ':' type '.'
+    // theorem_body := "by" script | term
+    fn parse_theorem_body(&mut self) -> Result<ast::Body> {
+        if self.accept_token(TokenKind::By) {
+            Ok(ast::Body::Script(self.parse_script()?))
+        } else {
+            Ok(ast::Body::Term(self.parse_term()?))
+        }
+    }
+
+    // script := tactic (';' tactic)*
+    fn parse_script(&mut self) -> Result<ast::Script> {
+        let start = self.current.span;
+        let mut tactics = Vec::new();
+
+        tactics.push(self.parse_tactic()?);
+        while self.accept_token(TokenKind::Semicolon) {
+            tactics.push(self.parse_tactic()?);
+        }
+
+        Ok(ast::Script {
+            span: self.span_from(start),
+            tactics,
+        })
+    }
+
+    // tactic := "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit"
+    fn parse_tactic(&mut self) -> Result<ast::Tactic> {
+        const KNOWN_TACTICS: &str = "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption` and `admit`";
+
+        let start = self.current.span;
+
+        if !self.check_token(TokenKind::Ident) {
+            return Err(self
+                .unexpected_diagnostic("a tactic")
+                .with_note(KNOWN_TACTICS));
+        }
+
+        let name = self.current.text;
+        self.expect_token(TokenKind::Ident)?;
+
+        match name {
+            "intro" => {
+                let name = self.parse_ident()?;
+                Ok(ast::Tactic::Intro(ast::Intro {
+                    span: self.span_from(start),
+                    name,
+                }))
+            }
+            "exact" => {
+                let term = self.parse_term()?;
+                Ok(ast::Tactic::Exact(ast::Exact {
+                    span: self.span_from(start),
+                    term,
+                }))
+            }
+            "split" => Ok(ast::Tactic::Split(ast::Split {
+                span: self.span_from(start),
+            })),
+            "left" => Ok(ast::Tactic::Left(ast::Left {
+                span: self.span_from(start),
+            })),
+            "right" => Ok(ast::Tactic::Right(ast::Right {
+                span: self.span_from(start),
+            })),
+            "assumption" => Ok(ast::Tactic::Assumption(ast::Assumption {
+                span: self.span_from(start),
+            })),
+            "admit" => Ok(ast::Tactic::Admit(ast::Admit {
+                span: self.span_from(start),
+            })),
+            _ => Err(Diagnostic::error(format!("unknown tactic `{name}`"), start)
+                .with_primary_label("unknown tactic")
+                .with_note(KNOWN_TACTICS)),
+        }
+    }
+
+    // proposition := "proposition" IDENT IDENT* ':=' type '.'
     fn parse_proposition(&mut self) -> Result<ast::Proposition> {
         let start = self.current.span;
         self.expect_token(TokenKind::Proposition)?;
@@ -1143,6 +1305,7 @@ fn is_keyword(kind: TokenKind) -> bool {
             | TokenKind::Snd
             | TokenKind::Absurd
             | TokenKind::TrustMe
+            | TokenKind::By
     )
 }
 
@@ -1166,13 +1329,17 @@ fn describe(kind: TokenKind) -> &'static str {
         TokenKind::Snd => "`snd`",
         TokenKind::Absurd => "`absurd`",
         TokenKind::TrustMe => "`trustme`",
+        TokenKind::By => "`by`",
         TokenKind::LeftParen => "`(`",
         TokenKind::RightParen => "`)`",
         TokenKind::LeftBracket => "`[`",
         TokenKind::RightBracket => "`]`",
+        TokenKind::LeftBrace => "`{`",
+        TokenKind::RightBrace => "`}`",
         TokenKind::Dot => "`.`",
         TokenKind::Bar => "`|`",
         TokenKind::Comma => "`,`",
+        TokenKind::Semicolon => "`;`",
         TokenKind::Colon => "`:`",
         TokenKind::ColonEqual => "`:=`",
         TokenKind::Equal => "`=`",
@@ -1211,7 +1378,7 @@ mod tests {
                 a.name.text,
                 a.arguments
                     .iter()
-                    .map(|arg| show_type(arg))
+                    .map(show_type)
                     .collect::<Vec<String>>()
                     .join(" ")
             ),
@@ -1281,13 +1448,44 @@ mod tests {
         }
     }
 
+    fn show_tactic(tactic: &ast::Tactic) -> String {
+        match tactic {
+            ast::Tactic::Intro(intro) => format!("(intro {})", intro.name.text),
+            ast::Tactic::Exact(exact) => format!("(exact {})", show_term(&exact.term)),
+            ast::Tactic::Split(_) => "split".to_string(),
+            ast::Tactic::Left(_) => "left".to_string(),
+            ast::Tactic::Right(_) => "right".to_string(),
+            ast::Tactic::Assumption(_) => "assumption".to_string(),
+            ast::Tactic::Admit(_) => "admit".to_string(),
+        }
+    }
+
+    fn show_script(script: &ast::Script) -> String {
+        format!(
+            "(script {})",
+            script
+                .tactics
+                .iter()
+                .map(show_tactic)
+                .collect::<Vec<String>>()
+                .join(" ")
+        )
+    }
+
+    fn show_body(body: &ast::Body) -> String {
+        match body {
+            ast::Body::Script(script) => show_script(script),
+            ast::Body::Term(term) => show_term(term),
+        }
+    }
+
     // Parse a single `theorem` and return its type and body rendered as
     // s-expressions.
     fn parse_theorem(source: &str) -> (String, String) {
         let module = parse(source).expect("should parse");
         assert_eq!(module.items.len(), 1);
         match &module.items[0] {
-            ast::Item::Theorem(t) => (show_type(&t.typ), show_term(&t.body)),
+            ast::Item::Theorem(t) => (show_type(&t.typ), show_body(&t.body)),
             other => panic!("expected a theorem, got {:?}", other),
         }
     }
@@ -1419,7 +1617,7 @@ mod tests {
                 assert_eq!(t.name.text, "mp");
                 assert_eq!(show_type(&t.typ), "(-> (and A (-> A B)) B)");
                 assert_eq!(
-                    show_term(&t.body),
+                    show_body(&t.body),
                     "(fun h : (and A (-> A B)) (app (snd h) (fst h)))"
                 );
             }
@@ -1515,6 +1713,107 @@ mod tests {
         }
     }
 
+    fn parse_body_str(source: &str) -> String {
+        let (_, body) = parse_theorem(&format!("theorem t : A := {source}."));
+        body
+    }
+
+    #[test]
+    fn test_tactic_script() {
+        assert_eq!(parse_body_str("by admit"), "(script admit)");
+        assert_eq!(
+            parse_body_str("by intro h; exact f h; split; left; right; assumption; admit"),
+            "(script (intro h) (exact (app f h)) split left right assumption admit)"
+        );
+        // A body without `by` is still a term.
+        assert_eq!(parse_body_str("f h"), "(app f h)");
+    }
+
+    #[test]
+    fn test_tactic_exact_term_ends_at_semicolon() {
+        // `;` is not a term atom, so the term after `exact` stops there, even inside a `fun` body
+        // or an application.
+        assert_eq!(
+            parse_body_str("by exact fun (x : A) => x; split"),
+            "(script (exact (fun x : A x)) split)"
+        );
+        assert_eq!(
+            parse_body_str("by exact f a b; exact c"),
+            "(script (exact (app (app f a) b)) (exact c))"
+        );
+    }
+
+    #[test]
+    fn test_tactic_names_are_not_keywords() {
+        // Tactic names are only special in tactic position.
+        assert_eq!(
+            parse_body_str("split left right"),
+            "(app (app split left) right)"
+        );
+        assert_eq!(
+            parse_body_str("by intro left; exact left"),
+            "(script (intro left) (exact left))"
+        );
+        assert_eq!(
+            parse_body_str("fun (split : A) => split"),
+            "(fun split : A split)"
+        );
+    }
+
+    #[test]
+    fn test_tactic_spans() {
+        let source = "theorem t : A := by intro h; exact f h; split.";
+        let module = parse(source).expect("should parse");
+        let ast::Item::Theorem(theorem) = &module.items[0] else {
+            panic!("expected a theorem");
+        };
+        let ast::Body::Script(script) = &theorem.body else {
+            panic!("expected a tactic script");
+        };
+        let text = |span: crate::diagnostics::Span| &source[span.start..span.end];
+
+        // The script covers every tactic, but not `by` or the closing `.`.
+        assert_eq!(text(script.span), "intro h; exact f h; split");
+        // Each tactic covers its name and its arguments.
+        let tactics: Vec<&str> = script.tactics.iter().map(|t| text(t.span())).collect();
+        assert_eq!(tactics, vec!["intro h", "exact f h", "split"]);
+    }
+
+    #[test]
+    fn test_tactic_parse_errors() {
+        // An unknown tactic is reported at its name, with the list of known tactics.
+        let source = "theorem t : A := by intro h; frobnicate h.";
+        let diag = parse_error(source);
+        assert_eq!(diag.message, "unknown tactic `frobnicate`");
+        assert_eq!(
+            diag.labels[0].span.start,
+            source.find("frobnicate").unwrap()
+        );
+        assert_eq!(
+            diag.notes,
+            vec![
+                "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption` and `admit`"
+            ]
+        );
+
+        // `intro` needs a name.
+        let source = "theorem t : A := by intro; split.";
+        let diag = parse_error(source);
+        assert_eq!(diag.message, "expected an identifier, found `;`");
+        assert_eq!(diag.labels[0].span.start, source.find(";").unwrap());
+
+        // A script needs at least one tactic.
+        let source = "theorem t : A := by .";
+        let diag = parse_error(source);
+        assert_eq!(diag.message, "expected a tactic, found `.`");
+        assert_eq!(diag.labels[0].span.start, source.find(".").unwrap());
+
+        assert!(parse("theorem t : A := by exact .").is_err()); // `exact` needs a term
+        assert!(parse("theorem t : A := by split left.").is_err()); // missing `;`
+        assert!(parse("theorem t : A := by split").is_err()); // missing `.`
+        assert!(parse("theorem t : A := by (split).").is_err()); // not a tactic name
+    }
+
     #[test]
     fn test_parse_errors() {
         assert!(parse("axiom a A.").is_err()); // missing colon
@@ -1558,6 +1857,10 @@ mod tests {
                 "theorem or : A := x.",
                 "`or` is a keyword and cannot be used as a name",
             ),
+            (
+                "theorem by : A := x.",
+                "`by` is a keyword and cannot be used as a name",
+            ),
             ("theorem t : A = x.", "definitions use `:=`, not `=`"),
             (
                 "proposition P A : A.",
@@ -1589,9 +1892,9 @@ mod tests {
             fun
             case of inl inr
             fst snd
-            absurd trustme
-            ()[]
-            .|,: := = => -> <->
+            absurd trustme by
+            ()[]{}
+            .|,;: := = => -> <->
             foo_bar_1'
         "#;
 
@@ -1613,13 +1916,17 @@ mod tests {
             (TokenKind::Snd, "snd"),
             (TokenKind::Absurd, "absurd"),
             (TokenKind::TrustMe, "trustme"),
+            (TokenKind::By, "by"),
             (TokenKind::LeftParen, "("),
             (TokenKind::RightParen, ")"),
             (TokenKind::LeftBracket, "["),
             (TokenKind::RightBracket, "]"),
+            (TokenKind::LeftBrace, "{"),
+            (TokenKind::RightBrace, "}"),
             (TokenKind::Dot, "."),
             (TokenKind::Bar, "|"),
             (TokenKind::Comma, ","),
+            (TokenKind::Semicolon, ";"),
             (TokenKind::Colon, ":"),
             (TokenKind::ColonEqual, ":="),
             (TokenKind::Equal, "="),
