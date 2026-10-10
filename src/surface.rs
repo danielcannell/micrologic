@@ -10,7 +10,7 @@
 // script            := (tactic (';' tactic)*)?
 // tactic            := tactic_focus | tactic_intro | tactic_exact | tactic_split | tactic_left |
 //                      tactic_right | tactic_assumption | tactic_admit | tactic_exfalso |
-//                      tactic_destruct | tactic_cases | tactic_have | tactic_apply
+//                      tactic_destruct | tactic_cases | tactic_have | tactic_apply | tactic_absurd
 // tactic_focus      := '{' script '}'
 // tactic_intro      := "intro" IDENT
 // tactic_exact      := "exact" term
@@ -22,8 +22,9 @@
 // tactic_exfalso    := "exfalso"
 // tactic_destruct   := "destruct" IDENT "as" IDENT IDENT
 // tactic_cases      := "cases" IDENT "as" IDENT IDENT
-// tactic_have       := "have" IDENT ':' type
+// tactic_have       := "have" IDENT ':' type (":=" term)?
 // tactic_apply      := "apply" term
+// tactic_absurd     := "absurd" term
 //
 // type        := type_lambda ("<->" type)?
 // type_lambda := type_or ("->" type)?
@@ -117,6 +118,7 @@ pub mod ast {
         Cases(Cases),
         Have(Have),
         Apply(Apply),
+        Absurd(AbsurdTactic),
     }
 
     impl Tactic {
@@ -135,6 +137,7 @@ pub mod ast {
                 Tactic::Cases(cases) => cases.span,
                 Tactic::Have(have) => have.span,
                 Tactic::Apply(apply) => apply.span,
+                Tactic::Absurd(absurd) => absurd.span,
             }
         }
     }
@@ -204,14 +207,23 @@ pub mod ast {
     }
 
     #[derive(Debug, Clone)]
+    /// `have h : T` or `have h : T := proof`
     pub struct Have {
         pub span: Span,
         pub hypothesis: Ident,
         pub typ: Type,
+        pub proof: Option<Term>,
     }
 
     #[derive(Debug, Clone)]
     pub struct Apply {
+        pub span: Span,
+        pub term: Term,
+    }
+
+    /// The `absurd h` tactic (named apart from the `absurd [C] t` term, [`Absurd`]).
+    #[derive(Debug, Clone)]
+    pub struct AbsurdTactic {
         pub span: Span,
         pub term: Term,
     }
@@ -792,7 +804,7 @@ impl<'source> Parser<'source> {
 
     // tactic            := tactic_focus | tactic_intro | tactic_exact | tactic_split | tactic_left |
     //                      tactic_right | tactic_assumption | tactic_admit | tactic_exfalso |
-    //                      tactic_destruct | tactic_cases | tactic_have | tactic_apply
+    //                      tactic_destruct | tactic_cases | tactic_have | tactic_apply | tactic_absurd
     // tactic_focus      := '{' script '}'
     // tactic_intro      := "intro" IDENT
     // tactic_exact      := "exact" term
@@ -804,10 +816,11 @@ impl<'source> Parser<'source> {
     // tactic_exfalso    := "exfalso"
     // tactic_destruct   := "destruct" IDENT "as" IDENT IDENT
     // tactic_cases      := "cases" IDENT "as" IDENT IDENT
-    // tactic_have       := "have" IDENT ':' type
+    // tactic_have       := "have" IDENT ':' type (":=" term)?
     // tactic_apply      := "apply" term
+    // tactic_absurd     := "absurd" term
     fn parse_tactic(&mut self) -> Result<ast::Tactic> {
-        const KNOWN_TACTICS: &str = "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption`, `admit`, `exfalso`, `destruct`, `cases`, `have` and `apply`";
+        const KNOWN_TACTICS: &str = "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption`, `admit`, `exfalso`, `destruct`, `cases`, `have`, `apply` and `absurd`";
 
         let start = self.current.span;
 
@@ -819,6 +832,15 @@ impl<'source> Parser<'source> {
             return Ok(ast::Tactic::Focus(ast::Focus {
                 span: self.span_from(start),
                 script,
+            }));
+        }
+
+        // `absurd` is a keyword (it's also a term), so it's matched by its token, not its name
+        if self.accept_token(TokenKind::Absurd) {
+            let term = self.parse_term()?;
+            return Ok(ast::Tactic::Absurd(ast::AbsurdTactic {
+                span: self.span_from(start),
+                term,
             }));
         }
 
@@ -893,10 +915,16 @@ impl<'source> Parser<'source> {
                 let hypothesis = self.parse_ident()?;
                 self.expect_token(TokenKind::Colon)?;
                 let typ = self.parse_type()?;
+                let proof = if self.accept_token(TokenKind::ColonEqual) {
+                    Some(self.parse_term()?)
+                } else {
+                    None
+                };
                 Ok(ast::Tactic::Have(ast::Have {
                     span: self.span_from(start),
                     hypothesis,
                     typ,
+                    proof,
                 }))
             }
             "apply" => {
@@ -1621,10 +1649,17 @@ mod tests {
                 "(cases {} {} {})",
                 cases.hypothesis.text, cases.left.text, cases.right.text
             ),
-            ast::Tactic::Have(have) => {
-                format!("(have {} {})", have.hypothesis.text, show_type(&have.typ))
-            }
+            ast::Tactic::Have(have) => match &have.proof {
+                None => format!("(have {} {})", have.hypothesis.text, show_type(&have.typ)),
+                Some(proof) => format!(
+                    "(have {} {} := {})",
+                    have.hypothesis.text,
+                    show_type(&have.typ),
+                    show_term(proof)
+                ),
+            },
             ast::Tactic::Apply(apply) => format!("(apply {})", show_term(&apply.term)),
+            ast::Tactic::Absurd(absurd) => format!("(absurd {})", show_term(&absurd.term)),
         }
     }
 
@@ -1955,6 +1990,30 @@ mod tests {
             "(script (focus (script (have h (-> A B)))))"
         );
         assert_eq!(parse_body_str("by have h : A"), "(script (have h A))");
+
+        // `have h : T := proof`: the type ends at `:=`, and the proof at `;`, `}` or `.`.
+        assert_eq!(
+            parse_body_str("by have h : A -> B := fun (a : A) => f a; exact h"),
+            "(script (have h (-> A B) := (fun a : A (app f a))) (exact h))"
+        );
+        assert_eq!(
+            parse_body_str("by { have h : A := a }"),
+            "(script (focus (script (have h A := a))))"
+        );
+    }
+
+    #[test]
+    fn test_absurd_tactic() {
+        assert_eq!(parse_body_str("by absurd h"), "(script (absurd h))");
+        assert_eq!(
+            parse_body_str("by absurd h [A]; exact a"),
+            "(script (absurd (h [A])) (exact a))"
+        );
+        // `absurd` is still a term too.
+        assert_eq!(
+            parse_body_str("by exact absurd [A] h"),
+            "(script (exact (absurd [A] h)))"
+        );
     }
 
     #[test]
@@ -2057,7 +2116,7 @@ mod tests {
             diag.notes,
             vec![
                 "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption`, \
-                 `admit`, `exfalso`, `destruct`, `cases`, `have` and `apply`"
+                 `admit`, `exfalso`, `destruct`, `cases`, `have`, `apply` and `absurd`"
             ]
         );
 
@@ -2105,6 +2164,12 @@ mod tests {
         let diag = parse_error("theorem t : A := by have h : ; exact h.");
         assert_eq!(diag.message, "expected a type, found `;`");
         assert!(parse("theorem t : A := by have : A.").is_err());
+
+        // `have ... :=` and `absurd` need a term.
+        let diag = parse_error("theorem t : A := by have h : A := .");
+        assert_eq!(diag.message, "expected a term, found `.`");
+        let diag = parse_error("theorem t : A := by absurd.");
+        assert_eq!(diag.message, "expected a term, found `.`");
 
         // `apply` needs a term.
         let diag = parse_error("theorem t : A := by apply.");

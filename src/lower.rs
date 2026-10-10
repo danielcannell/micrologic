@@ -386,6 +386,7 @@ fn lower_tactic(tactic: &surface::ast::Tactic, scope: &TypeScope) -> Result<tact
         surface::ast::Tactic::Cases(cases) => lower_cases(cases, scope),
         surface::ast::Tactic::Have(have) => lower_have(have, scope),
         surface::ast::Tactic::Apply(apply) => lower_apply(apply, scope),
+        surface::ast::Tactic::Absurd(absurd) => lower_absurd(absurd, scope),
     }
 }
 
@@ -462,6 +463,11 @@ fn lower_have(have: &surface::ast::Have, scope: &TypeScope) -> Result<tactic::Ta
         span: have.span,
         hypothesis: lower_name(&have.hypothesis),
         typ: lower_type(&have.typ, scope)?,
+        proof: have
+            .proof
+            .as_ref()
+            .map(|proof| lower_term(proof, scope))
+            .transpose()?,
     })
 }
 
@@ -469,6 +475,13 @@ fn lower_apply(apply: &surface::ast::Apply, scope: &TypeScope) -> Result<tactic:
     Ok(tactic::Tactic::Apply {
         span: apply.span,
         term: lower_term(&apply.term, scope)?,
+    })
+}
+
+fn lower_absurd(absurd: &surface::ast::AbsurdTactic, scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Absurd {
+        span: absurd.span,
+        term: lower_term(&absurd.term, scope)?,
     })
 }
 
@@ -853,6 +866,12 @@ mod tests {
 
         let script = lower_module_script("theorem t A : A := by apply a [A].");
         assert_eq!(show_script(&script), "(apply (var a [A]))");
+
+        let script = lower_module_script("theorem t A : A := by have h : A := a; absurd n [A].");
+        assert_eq!(
+            show_script(&script),
+            "(have h [A] := (var a)) (absurd (var n [A]))"
+        );
     }
 
     fn show_term(term: &kernel::Term) -> String {
@@ -904,9 +923,19 @@ mod tests {
                     ..
                 } => format!("(cases {} {} {})", hypothesis.text, left.text, right.text),
                 tactic::Tactic::Have {
-                    hypothesis, typ, ..
+                    hypothesis,
+                    typ,
+                    proof: None,
+                    ..
                 } => format!("(have {} [{typ}])", hypothesis.text),
+                tactic::Tactic::Have {
+                    hypothesis,
+                    typ,
+                    proof: Some(proof),
+                    ..
+                } => format!("(have {} [{typ}] := {})", hypothesis.text, show_term(proof)),
                 tactic::Tactic::Apply { term, .. } => format!("(apply {})", show_term(term)),
+                tactic::Tactic::Absurd { term, .. } => format!("(absurd {})", show_term(term)),
             })
             .collect();
         tactics.join(" ")
@@ -942,6 +971,15 @@ mod tests {
         );
         assert_eq!(
             lower_error("theorem t A : A -> A := by exact fun (x : Q) => x."),
+            unbound("Q")
+        );
+        // And in `have`'s proof, and `absurd`.
+        assert_eq!(
+            lower_error("theorem t A : A := by have h : A := f [Q]; exact h."),
+            unbound("Q")
+        );
+        assert_eq!(
+            lower_error("theorem t A : A := by absurd f [Q]."),
             unbound("Q")
         );
         // So are type arguments in `apply`.

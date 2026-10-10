@@ -783,7 +783,7 @@ struct Expectation {
 /// Check `term` against an `expected` type.
 ///
 /// This is equivalent to inferring the type and comparing it with `expected`, but pushes the
-/// expected type into lambdas, pairs, injections, `case` branches and `absurd` so that a mismatch
+/// expected type into lambdas, pairs, injections, `case` branches, `absurd` and redexes so that a mismatch
 /// is reported at the innermost sub-term that is wrong, rather than at the whole proof. `why` says
 /// where the expected type came from.
 fn check_against(
@@ -910,6 +910,33 @@ fn check_against(
             check_against(&left_ctx, left_body, expected, why, trust)?;
             let right_ctx = ctx.bind(right_name.clone(), Scheme::new_monomorphic(*right_type));
             check_against(&right_ctx, right_body, expected, why, trust)
+        }
+
+        // A redex `(fun (x : T) => body) argument`, which `have` builds: check the argument
+        // against `T` and the body against the expected type, so a mistake is reported in
+        // whichever one is wrong (the argument first, as it comes first in a script).
+        (
+            Term::Application {
+                function, argument, ..
+            },
+            _,
+        ) if matches!(**function, Term::Lambda { .. }) => {
+            let Term::Lambda {
+                span,
+                argument: name,
+                argument_type,
+                body,
+            } = &**function
+            else {
+                unreachable!("checked by the guard")
+            };
+            let declared = Expectation {
+                span: *span,
+                reason: "expected because of this declaration",
+            };
+            check_against(ctx, argument, argument_type, declared, trust)?;
+            let ctx = ctx.bind(name.clone(), Scheme::new_monomorphic(argument_type.clone()));
+            check_against(&ctx, body, expected, why, trust)
         }
 
         (
@@ -1468,6 +1495,51 @@ mod tests {
         assert_eq!(
             error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
             "`absurd` expects a proof of `False`"
+        );
+    }
+
+    #[test]
+    fn test_redex_is_checked_in_parts() {
+        // theorem bad A B : A -> B := fun (a : A) => (fun (b : B) => b) a
+        // The argument is checked against the lambda's declared type, so the error is about `a`,
+        // not the whole application.
+        let goal = scheme(&["A", "B"], arrow(atom("A"), atom("B")));
+        let redex = app(lam("b", atom("B"), var("b", vec![])), var("a", vec![]));
+        let body = lam("a", atom("A"), redex);
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "mismatched types: expected `B`, found `A`"
+        );
+
+        // And the body against the expected type.
+        // theorem bad A B : A -> B := fun (a : A) => (fun (x : A) => x) a
+        let redex = app(lam("x", atom("A"), var("x", vec![])), var("a", vec![]));
+        let body = lam("a", atom("A"), redex);
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "mismatched types: expected `B`, found `A`"
+        );
+
+        // A correct redex is accepted.
+        // theorem t A : A -> A := fun (a : A) => (fun (x : A) => x) a
+        let goal = scheme(&["A"], arrow(atom("A"), atom("A")));
+        let redex = app(lam("x", atom("A"), var("x", vec![])), var("a", vec![]));
+        let body = lam("a", atom("A"), redex);
+        assert_eq!(
+            check(&Context::new(), &body, &goal, NO_SPAN).unwrap(),
+            Trust::Proved
+        );
+    }
+
+    #[test]
+    fn test_redex_binder_is_scoped_to_the_body() {
+        // theorem bad A : A := (fun (x : A) => x) x
+        // `x` is bound in the lambda's body, not in its argument.
+        let goal = scheme(&["A"], atom("A"));
+        let body = app(lam("x", atom("A"), var("x", vec![])), var("x", vec![]));
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "cannot find `x` in this scope"
         );
     }
 }

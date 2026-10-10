@@ -601,6 +601,14 @@ mod tests {
                 "theorem bad A B : (A -> B) -> A := by intro f; apply f.",
                 "`apply` can't use `f` to prove `A`",
             ),
+            (
+                "theorem bad A B : A -> B := by intro a; absurd a.",
+                "`absurd` can't use `a` to prove `False`",
+            ),
+            (
+                "theorem bad A B : A -> B := by intro a; have b : B := a; exact b.",
+                "mismatched types: expected `B`, found `A`",
+            ),
             // The second `h` hides the first, so `exact h` refers to `h : B`.
             (
                 "theorem bad A B : A -> B -> A := by intro h; intro h; exact h.",

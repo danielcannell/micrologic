@@ -5,7 +5,7 @@ theorem by_contradiction A : not not A -> A := by
     intro not_not_a;
 
     -- Either A is true or A is false; examine the two cases
-    have a_or_not_a : A or not A; { exact excluded_middle [A] };
+    have a_or_not_a : A or not A := excluded_middle [A];
     cases a_or_not_a as a not_a;
     {
         -- If A is true, then that is exactly our goal
@@ -13,7 +13,7 @@ theorem by_contradiction A : not not A -> A := by
     };
     {
         -- If A is false, then not not A leads to a contradiction
-        exfalso; exact not_not_a not_a
+        absurd not_not_a; exact not_a
     }.
 
 proposition Knight A := A.
@@ -61,7 +61,7 @@ theorem puzzle1' Alice Bob : Puzzle1 Alice Bob <-> (Knave Alice and Knight Bob) 
             intro knight_alice;
 
             -- Then her statement is true, making her a knave
-            have knave_alice : Knave Alice; { exact fst (if_knight knight_alice) };
+            have knave_alice : Knave Alice := fst (if_knight knight_alice);
 
             -- Which is a contradiction
             exact knave_alice knight_alice
@@ -94,7 +94,7 @@ theorem puzzle1' Alice Bob : Puzzle1 Alice Bob <-> (Knave Alice and Knight Bob) 
         split;
         {
             -- Alice isn't a knight, so this case can't happen
-            intro knight_alice; exfalso; exact knave_alice knight_alice
+            intro knight_alice; absurd knave_alice; exact knight_alice
         };
         {
             -- Alice and Bob are both knaves, which is the opposite of Alice's statement. This is consistent with her

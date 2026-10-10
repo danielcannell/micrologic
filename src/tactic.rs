@@ -63,8 +63,14 @@ pub enum Tactic {
         span: Span,
         hypothesis: Name,
         typ: kernel::Type,
+        /// The proof from `have h : T := proof`, if given.
+        proof: Option<kernel::Term>,
     },
     Apply {
+        span: Span,
+        term: kernel::Term,
+    },
+    Absurd {
         span: Span,
         term: kernel::Term,
     },
@@ -86,6 +92,7 @@ impl Tactic {
             Tactic::Cases { span, .. } => *span,
             Tactic::Have { span, .. } => *span,
             Tactic::Apply { span, .. } => *span,
+            Tactic::Absurd { span, .. } => *span,
         }
     }
 }
@@ -619,13 +626,7 @@ fn elaborate_focus(
                 }
             }
             Tactic::Exact { span: _, term } => {
-                // The kernel checks the term, but a name that isn't in scope is reported here,
-                // where the goal is known and can be shown.
-                for (name, name_span) in free_names(term) {
-                    if goal.lookup_local_by_name(name).is_none() && ctx.lookup(name).is_none() {
-                        return Err(unknown_name(name, name_span, &goal, proof_state));
-                    }
-                }
+                check_names(ctx, term, &goal, proof_state)?;
 
                 let solution = Partial::Term { term: term.clone() };
                 proof_state.add_solution(goal.id, solution);
@@ -885,10 +886,12 @@ fn elaborate_focus(
                 span,
                 hypothesis,
                 typ,
+                proof,
             } => {
                 // Transform `have h : T` to `(fun (h : T) => ?1) ?2` where:
                 //     ?1 is goal.locals, h : T ⊢ goal.target
                 //     ?2 is goal.locals ⊢ T
+                // With `have h : T := proof`, ?2 is `proof` and isn't a goal.
 
                 let mut new_locals = goal.locals.clone();
                 new_locals.push(Local {
@@ -897,7 +900,20 @@ fn elaborate_focus(
                 });
                 let new_goal_id = proof_state.push_new_goal(new_locals, goal.target.clone());
 
-                let h_goal_id = proof_state.push_new_goal(goal.locals.clone(), typ.clone());
+                let proof = match proof {
+                    None => Partial::Hole {
+                        goal_id: proof_state.push_new_goal(goal.locals.clone(), typ.clone()),
+                    },
+                    Some(proof) => {
+                        // Like `exact proof` on the goal `T`, which is never pushed. The kernel
+                        // checks `proof` has type `T`.
+                        let proof_goal = proof_state.new_goal(goal.locals.clone(), typ.clone());
+                        check_names(ctx, proof, &proof_goal, proof_state)?;
+                        Partial::Term {
+                            term: proof.clone(),
+                        }
+                    }
+                };
 
                 let solution = Partial::Application {
                     span: *span,
@@ -909,108 +925,155 @@ fn elaborate_focus(
                             goal_id: new_goal_id,
                         }),
                     }),
-                    argument: Box::new(Partial::Hole { goal_id: h_goal_id }),
+                    argument: Box::new(proof),
                 };
 
                 proof_state.add_solution(goal.id, solution);
             }
             Tactic::Apply { span, term } => {
-                // Only a name for now: its type comes from the goal or the context. Any other
-                // term would need type inference.
-                let kernel::Term::Var {
-                    span: name_span,
-                    name,
-                    type_arguments,
-                } = term
-                else {
-                    return Err(Diagnostic::error(
-                        "`apply` needs a hypothesis or theorem name",
-                        term.span(),
-                    )
-                    .with_primary_label("not a name")
-                    .with_note(
-                        "to apply a more complex term, give it a name first: \
-                         `have h : T; { exact <term> }; apply h`",
-                    ));
+                let solution =
+                    apply_name(ctx, "apply", *span, term, &goal.target, &goal, proof_state)?;
+                proof_state.add_solution(goal.id, solution);
+            }
+            Tactic::Absurd { span, term } => {
+                // `absurd h` is `exfalso; apply h`: `h` leads to `False`, from which anything
+                // follows.
+                let body = apply_name(
+                    ctx,
+                    "absurd",
+                    *span,
+                    term,
+                    &kernel::Type::False,
+                    &goal,
+                    proof_state,
+                )?;
+                let solution = Partial::Absurd {
+                    span: *span,
+                    goal_type: goal.target.clone(),
+                    body: Box::new(body),
                 };
-
-                // Locals first, as in the kernel.
-                let function_type = if let Some(local) = goal.lookup_local_by_name(name) {
-                    if !type_arguments.is_empty() {
-                        return Err(Diagnostic::error(
-                            format!("`{name}` takes no type arguments"),
-                            *name_span,
-                        )
-                        .with_primary_label(format!(
-                            "{} supplied",
-                            kernel::count(type_arguments.len(), "type argument")
-                        ))
-                        .with_note(format!(
-                            "`{name}` is a hypothesis; only theorems and axioms take type arguments"
-                        ))
-                        .with_note(goal_note(&goal)));
-                    }
-                    local.typ.clone()
-                } else if let Some((scheme, _)) = ctx.lookup(name) {
-                    scheme.instantiate(type_arguments).map_err(|mismatch| {
-                        kernel::type_arity_error(name, scheme, mismatch, *name_span)
-                            .with_note(goal_note(&goal))
-                    })?
-                } else {
-                    return Err(unknown_name(name, *name_span, &goal, proof_state));
-                };
-
-                // `f : P1 -> ... -> Pn -> C` proves the goal `C` from proofs of `P1` ... `Pn`. Take
-                // the smallest `n` that works, so that `f : A -> B -> C` on the goal `B -> C`
-                // leaves just `A`.
-                let mut premises = Vec::new();
-                let mut conclusion = &function_type;
-                while *conclusion != goal.target {
-                    let kernel::Type::Lambda {
-                        argument_type,
-                        result_type,
-                    } = conclusion
-                    else {
-                        return Err(Diagnostic::error(
-                            format!("`apply` can't use `{name}` to prove `{}`", goal.target),
-                            *name_span,
-                        )
-                        .with_primary_label(format!("`{name}` has type `{function_type}`"))
-                        .with_note(format!(
-                            "`apply {name}` needs `{name}` to have type `{target}`, or \
-                             `P -> {target}`, `P -> Q -> {target}` and so on",
-                            target = goal.target
-                        ))
-                        .with_note(goal_note(&goal)));
-                    };
-                    premises.push((**argument_type).clone());
-                    conclusion = result_type;
-                }
-
-                // Push the premises last first, so the first premise is the next goal.
-                let mut premise_goal_ids: Vec<GoalId> = premises
-                    .into_iter()
-                    .rev()
-                    .map(|premise| proof_state.push_new_goal(goal.locals.clone(), premise))
-                    .collect();
-                premise_goal_ids.reverse();
-
-                // `f ?1 ... ?n`
-                let solution = premise_goal_ids.into_iter().fold(
-                    Partial::Term { term: term.clone() },
-                    |function, goal_id| Partial::Application {
-                        span: *span,
-                        function: Box::new(function),
-                        argument: Box::new(Partial::Hole { goal_id }),
-                    },
-                );
-
                 proof_state.add_solution(goal.id, solution);
             }
         }
     }
 
     proof_state.pop_focus(script)
+}
+
+/// Check that every name `term` refers to (other than those it binds itself) is a visible
+/// hypothesis of `goal` or a theorem/axiom. The kernel checks the term properly later; this just
+/// reports an unknown name here, where the goal is known and can be shown.
+fn check_names(
+    ctx: &kernel::Context,
+    term: &kernel::Term,
+    goal: &Goal,
+    proof_state: &ProofState,
+) -> Result<()> {
+    for (name, name_span) in free_names(term) {
+        if goal.lookup_local_by_name(name).is_none() && ctx.lookup(name).is_none() {
+            return Err(unknown_name(name, name_span, goal, proof_state));
+        }
+    }
+    Ok(())
+}
+
+/// Prove `target` using the hypothesis or theorem named by `term`, as `apply` does: with
+/// `f : P1 -> ... -> Pn -> target`, push goals for `P1` ... `Pn` (with `goal`'s hypotheses) and
+/// return `f ?1 ... ?n`. `tactic` names the tactic in errors, and `span` is its span.
+fn apply_name(
+    ctx: &kernel::Context,
+    tactic: &str,
+    span: Span,
+    term: &kernel::Term,
+    target: &kernel::Type,
+    goal: &Goal,
+    proof_state: &mut ProofState,
+) -> Result<Partial> {
+    // Only a name for now: its type comes from the goal or the context. Any other term would need
+    // type inference.
+    let kernel::Term::Var {
+        span: name_span,
+        name,
+        type_arguments,
+    } = term
+    else {
+        return Err(Diagnostic::error(
+            format!("`{tactic}` needs a hypothesis or theorem name"),
+            term.span(),
+        )
+        .with_primary_label("not a name")
+        .with_note(format!(
+            "to use a more complex term, give it a name first: \
+             `have h : T := <term>; {tactic} h`"
+        )));
+    };
+
+    // Locals first, as in the kernel.
+    let function_type = if let Some(local) = goal.lookup_local_by_name(name) {
+        if !type_arguments.is_empty() {
+            return Err(
+                Diagnostic::error(format!("`{name}` takes no type arguments"), *name_span)
+                    .with_primary_label(format!(
+                        "{} supplied",
+                        kernel::count(type_arguments.len(), "type argument")
+                    ))
+                    .with_note(format!(
+                        "`{name}` is a hypothesis; only theorems and axioms take type arguments"
+                    ))
+                    .with_note(goal_note(goal)),
+            );
+        }
+        local.typ.clone()
+    } else if let Some((scheme, _)) = ctx.lookup(name) {
+        scheme.instantiate(type_arguments).map_err(|mismatch| {
+            kernel::type_arity_error(name, scheme, mismatch, *name_span).with_note(goal_note(goal))
+        })?
+    } else {
+        return Err(unknown_name(name, *name_span, goal, proof_state));
+    };
+
+    // `f : P1 -> ... -> Pn -> C` proves `C` from proofs of `P1` ... `Pn`. Take the smallest `n`
+    // that works, so that `f : A -> B -> C` on the goal `B -> C` leaves just `A`.
+    let mut premises = Vec::new();
+    let mut conclusion = &function_type;
+    while conclusion != target {
+        let kernel::Type::Lambda {
+            argument_type,
+            result_type,
+        } = conclusion
+        else {
+            return Err(Diagnostic::error(
+                format!("`{tactic}` can't use `{name}` to prove `{target}`"),
+                *name_span,
+            )
+            .with_primary_label(format!("`{name}` has type `{function_type}`"))
+            .with_note(format!(
+                "`{tactic} {name}` needs `{name}` to have type `{target}`, or `P -> {target}`, \
+                 `P -> Q -> {target}` and so on"
+            ))
+            .with_note(goal_note(goal)));
+        };
+        premises.push((**argument_type).clone());
+        conclusion = result_type;
+    }
+
+    // Push the premises last first, so the first premise is the next goal.
+    let mut premise_goal_ids: Vec<GoalId> = premises
+        .into_iter()
+        .rev()
+        .map(|premise| proof_state.push_new_goal(goal.locals.clone(), premise))
+        .collect();
+    premise_goal_ids.reverse();
+
+    // `f ?1 ... ?n`
+    Ok(premise_goal_ids.into_iter().fold(
+        Partial::Term { term: term.clone() },
+        |function, goal_id| Partial::Application {
+            span,
+            function: Box::new(function),
+            argument: Box::new(Partial::Hole { goal_id }),
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1878,6 +1941,133 @@ mod tests {
             vec![
                 "`id` has type parameters `A`; supply one type for each: `id [A]`",
                 "the goal is\n⊢ B -> B",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_have_with_proof() {
+        // The proof is used directly, so there's no goal for it.
+        assert_eq!(
+            elaborate_str(
+                "theorem t A : A -> A and A := by intro a; have h : A := a; split; exact h; exact h."
+            ),
+            "(fun a [A] (app (fun h [A] (pair h h)) a))"
+        );
+        // The same term as proving it in a block.
+        assert_eq!(
+            elaborate_str(
+                "theorem t A : A -> A and A := by \
+                 intro a; have h : A; { exact a }; split; exact h; exact h."
+            ),
+            "(fun a [A] (app (fun h [A] (pair h h)) a))"
+        );
+    }
+
+    #[test]
+    fn test_have_with_proof_errors() {
+        // The hypothesis isn't available in its own proof.
+        let source = "theorem t A : A := by have h : A := h; exact h.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "cannot find `h` in this scope");
+        assert_eq!(
+            diag.labels[0].span.start,
+            source.find(":= h").unwrap() + ":= ".len()
+        );
+        assert_eq!(
+            diag.notes,
+            vec![
+                "`h` is a hypothesis of a later goal, but not of this one; for example, the \
+                 hypothesis of a `have` can't be used in its own proof",
+                "the goal is\n⊢ A",
+            ]
+        );
+
+        // A proof of the wrong type is reported by the kernel, at the proof.
+        let source = "theorem t A B : A -> B := by intro a; have b : B := a; exact b.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "mismatched types: expected `B`, found `A`");
+        assert_eq!(
+            primary_label(source, &diag),
+            ("a".to_string(), "this has type `A`".to_string())
+        );
+        assert_eq!(
+            diag.labels[0].span.start,
+            source.find(":= a").unwrap() + ":= ".len()
+        );
+        assert_eq!(
+            diag.labels[1].message.as_deref(),
+            Some("expected because of this declaration")
+        );
+    }
+
+    #[test]
+    fn test_absurd() {
+        // `absurd h` is `exfalso; apply h`.
+        assert_eq!(
+            elaborate_str(
+                "theorem t A B : A -> not A -> B := by intro a; intro na; absurd na; exact a."
+            ),
+            "(fun a [A] (fun na [not A] (absurd [B] (app na a))))"
+        );
+        // A proof of `False` leaves no goals.
+        assert_eq!(
+            elaborate_str("theorem t A : False -> A := by intro f; absurd f."),
+            "(fun f [False] (absurd [A] f))"
+        );
+        // Several premises become goals, in order.
+        assert_eq!(
+            elaborate_str(
+                "theorem t A B C : (A -> B -> False) -> A -> B -> C := by \
+                 intro f; intro a; intro b; absurd f; exact a; exact b."
+            ),
+            "(fun f [A -> not B] (fun a [A] (fun b [B] (absurd [C] (app (app f a) b)))))"
+        );
+    }
+
+    #[test]
+    fn test_absurd_and_have_are_accepted_by_the_kernel() {
+        let summary = crate::process_module(
+            r#"
+            axiom em A : A or not A.
+            theorem dne A : not not A -> A := by
+                intro nna; have h : A or not A := em [A];
+                cases h as a na; { exact a }; { absurd nna; exact na }.
+            theorem explode A B : A -> not A -> B := by intro a; intro na; absurd na; exact a.
+            theorem from_theorem A B : not (A and not A) -> A -> not A -> B := by
+                intro contra; intro a; intro na; absurd contra; split; exact a; exact na.
+            "#,
+        )
+        .unwrap_or_else(|diag| panic!("should accept, but got `{}`", diag.message));
+        assert_eq!((summary.proved, summary.admitted), (3, 0));
+    }
+
+    #[test]
+    fn test_absurd_errors() {
+        let source = "theorem t A B : A -> B := by intro a; absurd a.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "`absurd` can't use `a` to prove `False`");
+        assert_eq!(
+            primary_label(source, &diag),
+            ("a".to_string(), "`a` has type `A`".to_string())
+        );
+        assert_eq!(
+            diag.notes,
+            vec![
+                "`absurd a` needs `a` to have type `False`, or `P -> False`, `P -> Q -> False` \
+                 and so on",
+                "the goal is\na : A\n⊢ B",
+            ]
+        );
+
+        let source = "theorem t A : A -> A := by intro a; absurd (fun (x : A) => x).";
+        let diag = reject(source);
+        assert_eq!(diag.message, "`absurd` needs a hypothesis or theorem name");
+        assert_eq!(
+            diag.notes,
+            vec![
+                "to use a more complex term, give it a name first: \
+                 `have h : T := <term>; absurd h`"
             ]
         );
     }
