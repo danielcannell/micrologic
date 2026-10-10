@@ -236,11 +236,11 @@ mod tests {
             ),
             (
                 "theorem bad A : A := absurd [A] (fun (f : False) => f).",
-                "`absurd` expects a proof of `False`",
+                "mismatched types: expected `False`, found `True`",
             ),
             (
                 "theorem bad A : not not A -> A := fun (h : not not A) => absurd [A] h.",
-                "`absurd` expects a proof of `False`",
+                "mismatched types: expected `False`, found `not not A`",
             ),
             (
                 "theorem bad A B : A or B -> A := fun (h : A or B) => case h of | inl x => x | inr y => y.",
@@ -447,6 +447,35 @@ mod tests {
     }
 
     #[test]
+    fn test_mismatch_inside_absurd() {
+        // Inside `absurd`, the expected `False` comes from the `absurd`, not the statement, and
+        // the error points at the wrong sub-term.
+        assert_eq!(
+            labels("theorem t A B : A -> B := fun (a : A) => absurd [B] a."),
+            vec![
+                pair("a", "this has type `A`"),
+                pair("absurd [B] a", "this needs a proof of `False`"),
+            ]
+        );
+        // The same through `exfalso`, whose `absurd` takes the tactic's span.
+        assert_eq!(
+            labels("theorem t A B : A -> B := by intro a; exfalso; exact a."),
+            vec![
+                pair("a", "this has type `A`"),
+                pair("exfalso", "this needs a proof of `False`"),
+            ]
+        );
+        // A wrong annotation is reported at the `absurd`.
+        assert_eq!(
+            labels("theorem t A B : False -> A := fun (f : False) => absurd [B] f."),
+            vec![
+                pair("absurd [B] f", "annotated as `B`, but `A` is expected"),
+                pair("False -> A", "expected because of this statement"),
+            ]
+        );
+    }
+
+    #[test]
     fn test_errors_unrelated_to_the_statement_do_not_point_at_it() {
         assert_eq!(
             labels("theorem t A B : (A -> B) -> B -> B := fun (f : A -> B) => fun (b : B) => f b."),
@@ -550,7 +579,7 @@ mod tests {
             ),
             (
                 "theorem bad A B : A -> B := by intro a; exfalso; exact a.",
-                "`absurd` expects a proof of `False`",
+                "mismatched types: expected `False`, found `A`",
             ),
             (
                 "theorem bad A B : A or B -> A := by intro h; destruct h as a b; exact a.",

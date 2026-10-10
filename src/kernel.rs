@@ -764,21 +764,33 @@ pub fn type_arity_error(
 /// Returns whether the proof is complete or relies on a `trustme`.
 pub fn check(ctx: &Context, term: &Term, scheme: &Scheme, statement: Span) -> Result<Trust> {
     let mut trust = Trust::Proved;
-    check_against(ctx, term, &scheme.typ, statement, &mut trust)?;
+    let why = Expectation {
+        span: statement,
+        reason: "expected because of this statement",
+    };
+    check_against(ctx, term, &scheme.typ, why, &mut trust)?;
     Ok(trust)
+}
+
+/// Where an expected type came from, shown as a secondary label on a mismatch: usually the theorem's
+/// statement, but inside `absurd [C] t` the expected `False` comes from the `absurd`.
+#[derive(Debug, Clone, Copy)]
+struct Expectation {
+    span: Span,
+    reason: &'static str,
 }
 
 /// Check `term` against an `expected` type.
 ///
 /// This is equivalent to inferring the type and comparing it with `expected`, but pushes the
-/// expected type into lambdas, pairs and case branches so that a mismatch is reported at the
-/// innermost sub-term that is wrong, rather than at the whole proof. `statement` is where the
-/// expected type came from.
+/// expected type into lambdas, pairs, injections, `case` branches and `absurd` so that a mismatch
+/// is reported at the innermost sub-term that is wrong, rather than at the whole proof. `why` says
+/// where the expected type came from.
 fn check_against(
     ctx: &Context,
     term: &Term,
     expected: &Type,
-    statement: Span,
+    why: Expectation,
     trust: &mut Trust,
 ) -> Result<()> {
     match (term, expected) {
@@ -802,13 +814,13 @@ fn check_against(
                 .with_primary_label(format!(
                     "`{argument}` is declared as `{argument_type}`, but `{expected_argument_type}` is expected"
                 ))
-                .with_label(statement, "expected because of this statement"));
+                .with_label(why.span, why.reason));
             }
             let ctx = ctx.bind(
                 argument.clone(),
                 Scheme::new_monomorphic(argument_type.clone()),
             );
-            check_against(&ctx, body, expected_result_type, statement, trust)
+            check_against(&ctx, body, expected_result_type, why, trust)
         }
 
         (
@@ -818,8 +830,8 @@ fn check_against(
                 right_type,
             },
         ) => {
-            check_against(ctx, left, left_type, statement, trust)?;
-            check_against(ctx, right, right_type, statement, trust)
+            check_against(ctx, left, left_type, why, trust)?;
+            check_against(ctx, right, right_type, why, trust)
         }
 
         (
@@ -840,10 +852,10 @@ fn check_against(
                     right_type,
                     expected_right_type,
                     *span,
-                    statement,
+                    why,
                 ));
             }
-            check_against(ctx, left, expected_left_type, statement, trust)
+            check_against(ctx, left, expected_left_type, why, trust)
         }
 
         (
@@ -864,10 +876,10 @@ fn check_against(
                     left_type,
                     expected_left_type,
                     *span,
-                    statement,
+                    why,
                 ));
             }
-            check_against(ctx, right, expected_right_type, statement, trust)
+            check_against(ctx, right, expected_right_type, why, trust)
         }
 
         (
@@ -895,9 +907,35 @@ fn check_against(
                 }
             };
             let left_ctx = ctx.bind(left_name.clone(), Scheme::new_monomorphic(*left_type));
-            check_against(&left_ctx, left_body, expected, statement, trust)?;
+            check_against(&left_ctx, left_body, expected, why, trust)?;
             let right_ctx = ctx.bind(right_name.clone(), Scheme::new_monomorphic(*right_type));
-            check_against(&right_ctx, right_body, expected, statement, trust)
+            check_against(&right_ctx, right_body, expected, why, trust)
+        }
+
+        (
+            Term::Absurd {
+                span,
+                goal_type,
+                body,
+            },
+            _,
+        ) => {
+            // The annotation must be the expected type, exactly as inferring `absurd [C] t` (which
+            // gives `C`) and comparing would require.
+            if goal_type != expected {
+                return Err(
+                    Diagnostic::error("`absurd` is annotated with the wrong type", *span)
+                        .with_primary_label(format!(
+                            "annotated as `{goal_type}`, but `{expected}` is expected"
+                        ))
+                        .with_label(why.span, why.reason),
+                );
+            }
+            let why = Expectation {
+                span: *span,
+                reason: "this needs a proof of `False`",
+            };
+            check_against(ctx, body, &Type::False, why, trust)
         }
 
         _ => {
@@ -910,7 +948,7 @@ fn check_against(
                     term.span(),
                 )
                 .with_primary_label(format!("this has type `{inferred}`"))
-                .with_label(statement, "expected because of this statement"))
+                .with_label(why.span, why.reason))
             }
         }
     }
@@ -924,7 +962,7 @@ fn wrong_injection_annotation(
     annotation: &Type,
     expected: &Type,
     span: Span,
-    statement: Span,
+    why: Expectation,
 ) -> Diagnostic {
     Diagnostic::error(
         format!("`{injection}` is annotated with the wrong {side} side"),
@@ -933,7 +971,7 @@ fn wrong_injection_annotation(
     .with_primary_label(format!(
         "the {side} side is annotated as `{annotation}`, but `{expected}` is expected"
     ))
-    .with_label(statement, "expected because of this statement")
+    .with_label(why.span, why.reason)
 }
 
 #[cfg(test)]
@@ -1363,6 +1401,73 @@ mod tests {
         assert_eq!(
             error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
             "`inr` is annotated with the wrong left side"
+        );
+    }
+
+    fn absurd(goal_type: Type, body: Term) -> Term {
+        Term::Absurd {
+            span: NO_SPAN,
+            goal_type,
+            body: Box::new(body),
+        }
+    }
+
+    #[test]
+    fn test_absurd_annotation_must_match_the_expected_type() {
+        // theorem bad A B : False -> A := fun (f : False) => absurd [B] f
+        // Inferring `absurd [B] f` gives `B`, so checking against `A` must fail too: `check_against`
+        // accepts exactly the terms that infer-then-compare does.
+        let goal = scheme(&["A", "B"], arrow(Type::False, atom("A")));
+        let body = lam("f", Type::False, absurd(atom("B"), var("f", vec![])));
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "`absurd` is annotated with the wrong type"
+        );
+
+        // With the right annotation it's accepted.
+        let body = lam("f", Type::False, absurd(atom("A"), var("f", vec![])));
+        assert_eq!(
+            check(&Context::new(), &body, &goal, NO_SPAN).unwrap(),
+            Trust::Proved
+        );
+    }
+
+    #[test]
+    fn test_absurd_body_is_checked_against_false() {
+        // theorem bad A B : A -> B := fun (a : A) => absurd [B] a
+        let goal = scheme(&["A", "B"], arrow(atom("A"), atom("B")));
+        let body = lam("a", atom("A"), absurd(atom("B"), var("a", vec![])));
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "mismatched types: expected `False`, found `A`"
+        );
+
+        // `False` is pushed into the body, so a lambda there is checked against `False` too.
+        // theorem bad A : A := absurd [A] (fun (f : False) => f)
+        let goal = scheme(&["A"], atom("A"));
+        let body = absurd(atom("A"), lam("f", Type::False, var("f", vec![])));
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "mismatched types: expected `False`, found `True`"
+        );
+    }
+
+    #[test]
+    fn test_absurd_without_an_expected_type() {
+        // In a function position there's no expected type, so `absurd` is inferred and the old
+        // message is used. theorem bad A B : A -> B := fun (a : A) => (absurd [A -> B] a) a
+        let goal = scheme(&["A", "B"], arrow(atom("A"), atom("B")));
+        let body = lam(
+            "a",
+            atom("A"),
+            app(
+                absurd(arrow(atom("A"), atom("B")), var("a", vec![])),
+                var("a", vec![]),
+            ),
+        );
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "`absurd` expects a proof of `False`"
         );
     }
 }
