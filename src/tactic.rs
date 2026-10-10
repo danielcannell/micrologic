@@ -8,8 +8,15 @@ pub struct Script {
     pub tactics: Vec<Tactic>,
 }
 
+impl Script {
+    fn end_span(&self) -> Span {
+        self.tactics.last().map_or(self.span, Tactic::span)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Tactic {
+    Focus { span: Span, script: Script },
     Intro { span: Span, name: String },
     Exact { span: Span, term: kernel::Term },
     Split { span: Span },
@@ -17,11 +24,13 @@ pub enum Tactic {
     Right { span: Span },
     Assumption { span: Span },
     Admit { span: Span },
+    ExFalso { span: Span },
 }
 
 impl Tactic {
     fn span(&self) -> Span {
         match self {
+            Tactic::Focus { span, .. } => *span,
             Tactic::Intro { span, .. } => *span,
             Tactic::Exact { span, .. } => *span,
             Tactic::Split { span, .. } => *span,
@@ -29,6 +38,7 @@ impl Tactic {
             Tactic::Right { span, .. } => *span,
             Tactic::Assumption { span, .. } => *span,
             Tactic::Admit { span, .. } => *span,
+            Tactic::ExFalso { span, .. } => *span,
         }
     }
 }
@@ -137,6 +147,11 @@ enum Partial {
         left_type: kernel::Type,
         right: Box<Partial>,
     },
+    Absurd {
+        span: Span,
+        goal_type: kernel::Type,
+        body: Box<Partial>,
+    },
 }
 
 impl Partial {
@@ -181,30 +196,91 @@ impl Partial {
                 left_type,
                 right: Box::new(right.fill(solutions)),
             },
+            Partial::Absurd {
+                span,
+                goal_type,
+                body,
+            } => kernel::Term::Absurd {
+                span,
+                goal_type,
+                body: Box::new(body.fill(solutions)),
+            },
         }
     }
 }
 
 #[derive(Debug, Clone)]
 struct ProofState {
-    goals: Vec<Goal>,
+    goals: Vec<Vec<Goal>>,
     solutions: HashMap<GoalId, Partial>,
     next_goal_id: u64,
 }
 
 impl ProofState {
-    /// Push a goal onto the stack of goals
-    fn push_goal(&mut self, locals: Vec<Local>, target: kernel::Type) -> GoalId {
+    fn new() -> Self {
+        Self {
+            goals: Vec::new(),
+            solutions: HashMap::new(),
+            next_goal_id: 0,
+        }
+    }
+
+    fn new_goal(&mut self, locals: Vec<Local>, target: kernel::Type) -> Goal {
         let id = GoalId(self.next_goal_id);
         self.next_goal_id += 1;
-        let goal = Goal { id, locals, target };
-        self.goals.push(goal);
+        Goal { id, locals, target }
+    }
+
+    /// Push a goal onto the stack of goals
+    fn push_goal(&mut self, locals: Vec<Local>, target: kernel::Type) -> GoalId {
+        let goal = self.new_goal(locals, target);
+        let id = goal.id;
+
+        self.goals
+            .last_mut()
+            .expect("should always be at least one level of goals")
+            .push(goal);
+
         id
     }
 
     /// Pop the most recently added goal
     fn pop_goal(&mut self) -> Option<Goal> {
-        self.goals.pop()
+        self.goals
+            .last_mut()
+            .expect("should always be at least one level of goals")
+            .pop()
+    }
+
+    fn push_focus(&mut self, goal: Goal) {
+        self.goals.push(vec![goal]);
+    }
+
+    fn pop_focus(&mut self, span: Span) -> Result<()> {
+        let goals = self
+            .goals
+            .pop()
+            .expect("should always be at least one level of goals");
+
+        if !goals.is_empty() {
+            let n = goals.len();
+
+            let mut diag = Diagnostic::error(kernel::count(n, "unsolved goal"), span)
+                .with_primary_label("the proof is incomplete after this tactic");
+
+            // List the goals in the order the next tactics would work on them: the stack's top first.
+            for (i, goal) in goals.iter().rev().enumerate() {
+                diag = diag.with_note(if n == 1 {
+                    goal_note(goal)
+                } else {
+                    format!("goal {} of {n} is\n{goal}", i + 1)
+                });
+            }
+
+            return Err(diag);
+        }
+
+        Ok(())
     }
 
     fn add_solution(&mut self, goal_id: GoalId, solution: Partial) {
@@ -221,17 +297,25 @@ impl ProofState {
 /// This works backwards from the target type, building up a kernel term of that type sub-term by
 /// sub-term. The script is a list of tactics, and each tactic fills in further sub-terms.
 pub fn elaborate(
-    _ctx: &kernel::Context,
+    ctx: &kernel::Context,
     script: &Script,
     target: &kernel::Type,
 ) -> Result<kernel::Term> {
-    let mut proof_state = ProofState {
-        goals: Vec::new(),
-        solutions: HashMap::new(),
-        next_goal_id: 0,
-    };
+    let mut proof_state = ProofState::new();
+    let goal = proof_state.new_goal(Vec::new(), target.clone());
+    let goal_id = goal.id;
+    elaborate_focus(ctx, script, goal, &mut proof_state)?;
+    let partial = Partial::Hole { goal_id };
+    Ok(partial.fill(&mut proof_state.solutions))
+}
 
-    let root_goal_id = proof_state.push_goal(Vec::new(), target.clone());
+fn elaborate_focus(
+    _ctx: &kernel::Context,
+    script: &Script,
+    goal: Goal,
+    proof_state: &mut ProofState,
+) -> Result<()> {
+    proof_state.push_focus(goal);
 
     for tactic in &script.tactics {
         let goal = match proof_state.pop_goal() {
@@ -244,6 +328,9 @@ pub fn elaborate(
         };
 
         match tactic {
+            Tactic::Focus { span: _, script } => {
+                elaborate_focus(_ctx, script, goal, proof_state)?;
+            }
             Tactic::Intro { span, name } => {
                 if let kernel::Type::Lambda {
                     argument_type,
@@ -383,32 +470,22 @@ pub fn elaborate(
                 };
                 proof_state.add_solution(goal.id, solution);
             }
+            Tactic::ExFalso { span } => {
+                let new_goal_id = proof_state.push_goal(goal.locals.clone(), kernel::Type::False);
+
+                let solution = Partial::Absurd {
+                    span: *span,
+                    goal_type: goal.target,
+                    body: Box::new(Partial::Hole {
+                        goal_id: new_goal_id,
+                    }),
+                };
+                proof_state.add_solution(goal.id, solution);
+            }
         }
     }
 
-    if !proof_state.goals.is_empty() {
-        let n = proof_state.goals.len();
-        // Point at the last tactic rather than the whole (possibly many-line) script.
-        let span = script.tactics.last().map_or(script.span, Tactic::span);
-        let mut diag = Diagnostic::error(kernel::count(n, "unsolved goal"), span)
-            .with_primary_label("the proof is incomplete after this tactic");
-
-        // List the goals in the order the next tactics would work on them: the stack's top first.
-        for (i, goal) in proof_state.goals.iter().rev().enumerate() {
-            diag = diag.with_note(if n == 1 {
-                goal_note(goal)
-            } else {
-                format!("goal {} of {n} is\n{goal}", i + 1)
-            });
-        }
-
-        return Err(diag);
-    }
-
-    Ok(Partial::Hole {
-        goal_id: root_goal_id,
-    }
-    .fill(&mut proof_state.solutions))
+    proof_state.pop_focus(script.end_span())
 }
 
 #[cfg(test)]

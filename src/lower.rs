@@ -373,6 +373,7 @@ pub fn lower_script(script: &surface::ast::Script, scope: &TypeScope) -> Result<
 
 fn lower_tactic(tactic: &surface::ast::Tactic, scope: &TypeScope) -> Result<tactic::Tactic> {
     match tactic {
+        surface::ast::Tactic::Focus(focus) => lower_focus(focus, scope),
         surface::ast::Tactic::Intro(intro) => lower_intro(intro, scope),
         surface::ast::Tactic::Exact(exact) => lower_exact(exact, scope),
         surface::ast::Tactic::Split(split) => lower_split(split, scope),
@@ -380,7 +381,15 @@ fn lower_tactic(tactic: &surface::ast::Tactic, scope: &TypeScope) -> Result<tact
         surface::ast::Tactic::Right(right) => lower_right(right, scope),
         surface::ast::Tactic::Assumption(assumption) => lower_assumption(assumption, scope),
         surface::ast::Tactic::Admit(admit) => lower_admit(admit, scope),
+        surface::ast::Tactic::ExFalso(exfalso) => lower_exfalso(exfalso, scope),
     }
+}
+
+fn lower_focus(focus: &surface::ast::Focus, scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Focus {
+        span: focus.span,
+        script: lower_script(&focus.script, scope)?,
+    })
 }
 
 fn lower_intro(intro: &surface::ast::Intro, _scope: &TypeScope) -> Result<tactic::Tactic> {
@@ -420,6 +429,10 @@ fn lower_assumption(
 
 fn lower_admit(admit: &surface::ast::Admit, _scope: &TypeScope) -> Result<tactic::Tactic> {
     Ok(tactic::Tactic::Admit { span: admit.span })
+}
+
+fn lower_exfalso(exfalso: &surface::ast::ExFalso, _scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::ExFalso { span: exfalso.span })
 }
 
 #[cfg(test)]

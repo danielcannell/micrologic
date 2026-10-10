@@ -8,7 +8,7 @@
 //
 // theorem_body := "by" script | term
 // script       := tactic (';' tactic)*
-// tactic       := "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit"
+// tactic       := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso"
 //
 // type        := type_lambda ("<->" type)?
 // type_lambda := type_or ("->" type)?
@@ -89,6 +89,7 @@ pub mod ast {
 
     #[derive(Debug, Clone)]
     pub enum Tactic {
+        Focus(Focus),
         Intro(Intro),
         Exact(Exact),
         Split(Split),
@@ -96,11 +97,13 @@ pub mod ast {
         Right(Right),
         Assumption(Assumption),
         Admit(Admit),
+        ExFalso(ExFalso),
     }
 
     impl Tactic {
         pub fn span(&self) -> Span {
             match self {
+                Tactic::Focus(focus) => focus.span,
                 Tactic::Intro(intro) => intro.span,
                 Tactic::Exact(exact) => exact.span,
                 Tactic::Split(split) => split.span,
@@ -108,8 +111,15 @@ pub mod ast {
                 Tactic::Right(right) => right.span,
                 Tactic::Assumption(assumption) => assumption.span,
                 Tactic::Admit(admit) => admit.span,
+                Tactic::ExFalso(ex_false) => ex_false.span,
             }
         }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Focus {
+        pub span: Span,
+        pub script: Script,
     }
 
     #[derive(Debug, Clone)]
@@ -146,6 +156,11 @@ pub mod ast {
 
     #[derive(Debug, Clone)]
     pub struct Admit {
+        pub span: Span,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ExFalso {
         pub span: Span,
     }
 
@@ -709,12 +724,24 @@ impl<'source> Parser<'source> {
         })
     }
 
-    // tactic := "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit"
+    // tactic := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso"
     fn parse_tactic(&mut self) -> Result<ast::Tactic> {
         const KNOWN_TACTICS: &str = "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption` and `admit`";
 
         let start = self.current.span;
 
+        // Handle '{' script '}'
+        if self.accept_token(TokenKind::LeftBrace) {
+            let script = self.parse_script()?;
+            self.expect_token(TokenKind::RightBrace)?;
+
+            return Ok(ast::Tactic::Focus(ast::Focus {
+                span: self.span_from(start),
+                script,
+            }));
+        }
+
+        // All other tactic forms start with a tactic name
         if !self.check_token(TokenKind::Ident) {
             return Err(self
                 .unexpected_diagnostic("a tactic")
@@ -752,6 +779,9 @@ impl<'source> Parser<'source> {
                 span: self.span_from(start),
             })),
             "admit" => Ok(ast::Tactic::Admit(ast::Admit {
+                span: self.span_from(start),
+            })),
+            "exfalso" => Ok(ast::Tactic::ExFalso(ast::ExFalso {
                 span: self.span_from(start),
             })),
             _ => Err(Diagnostic::error(format!("unknown tactic `{name}`"), start)
@@ -1450,6 +1480,7 @@ mod tests {
 
     fn show_tactic(tactic: &ast::Tactic) -> String {
         match tactic {
+            ast::Tactic::Focus(focus) => format!("(focus {})", show_script(&focus.script)),
             ast::Tactic::Intro(intro) => format!("(intro {})", intro.name.text),
             ast::Tactic::Exact(exact) => format!("(exact {})", show_term(&exact.term)),
             ast::Tactic::Split(_) => "split".to_string(),

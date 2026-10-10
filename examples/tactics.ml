@@ -26,3 +26,6 @@ theorem or_intro A B : A -> B or A := by
 theorem not_not_intro A : A -> not not A := by
     intro a; intro na;
     exact na a.
+
+theorem exfalso A : False -> A := by
+    intro false; exfalso; assumption.
