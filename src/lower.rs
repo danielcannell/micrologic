@@ -385,6 +385,7 @@ fn lower_tactic(tactic: &surface::ast::Tactic, scope: &TypeScope) -> Result<tact
         surface::ast::Tactic::Destruct(destruct) => lower_destruct(destruct, scope),
         surface::ast::Tactic::Cases(cases) => lower_cases(cases, scope),
         surface::ast::Tactic::Have(have) => lower_have(have, scope),
+        surface::ast::Tactic::Apply(apply) => lower_apply(apply, scope),
     }
 }
 
@@ -461,6 +462,13 @@ fn lower_have(have: &surface::ast::Have, scope: &TypeScope) -> Result<tactic::Ta
         span: have.span,
         hypothesis: lower_name(&have.hypothesis),
         typ: lower_type(&have.typ, scope)?,
+    })
+}
+
+fn lower_apply(apply: &surface::ast::Apply, scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Apply {
+        span: apply.span,
+        term: lower_term(&apply.term, scope)?,
     })
 }
 
@@ -842,6 +850,27 @@ mod tests {
         let script =
             lower_module_script("theorem t A B : A := by have h : A or not B; cases h as a b.");
         assert_eq!(show_script(&script), "(have h [A or not B]) (cases h a b)");
+
+        let script = lower_module_script("theorem t A : A := by apply a [A].");
+        assert_eq!(show_script(&script), "(apply (var a [A]))");
+    }
+
+    fn show_term(term: &kernel::Term) -> String {
+        if let kernel::Term::Var {
+            name,
+            type_arguments,
+            ..
+        } = term
+        {
+            let mut out = format!("(var {name}");
+            for arg in type_arguments {
+                out.push_str(&format!(" [{arg}]"));
+            }
+            out.push(')');
+            out
+        } else {
+            panic!("expected a var term")
+        }
     }
 
     // The tactics of a lowered script, e.g. `(intro h) split`. Terms in `exact` are left out.
@@ -877,6 +906,7 @@ mod tests {
                 tactic::Tactic::Have {
                     hypothesis, typ, ..
                 } => format!("(have {} [{typ}])", hypothesis.text),
+                tactic::Tactic::Apply { term, .. } => format!("(apply {})", show_term(term)),
             })
             .collect();
         tactics.join(" ")
@@ -912,6 +942,11 @@ mod tests {
         );
         assert_eq!(
             lower_error("theorem t A : A -> A := by exact fun (x : Q) => x."),
+            unbound("Q")
+        );
+        // So are type arguments in `apply`.
+        assert_eq!(
+            lower_error("theorem t A : A := by apply f [Q]."),
             unbound("Q")
         );
         // The type in `have` is resolved too.

@@ -564,6 +564,14 @@ mod tests {
                 "theorem bad A B : A or B -> A := by intro h; cases h as a b; { exact a }; { exact b }.",
                 "mismatched types: expected `A`, found `B`",
             ),
+            (
+                "theorem bad A B : (A -> B) -> B := by intro f; apply f; assumption.",
+                "no hypothesis matches the goal",
+            ),
+            (
+                "theorem bad A B : (A -> B) -> A := by intro f; apply f.",
+                "`apply` can't use `f` to prove `A`",
+            ),
             // The second `h` hides the first, so `exact h` refers to `h : B`.
             (
                 "theorem bad A B : A -> B -> A := by intro h; intro h; exact h.",

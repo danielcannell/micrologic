@@ -43,17 +43,17 @@ theorem or_comm A B : A or B -> B or A := by
     { right; exact a };
     { left; exact b }.
 
--- theorem modus_tollens A B : (A -> B) -> not B -> not A := by
---     intro f; intro nb; intro a;
---     apply nb;
---     apply f;
---     exact a.
+theorem modus_tollens A B : (A -> B) -> not B -> not A := by
+    intro f; intro nb; intro a;
+    apply nb;
+    apply f;
+    exact a.
 
--- theorem explode A B : A -> not A -> B := by
---     intro a; intro na;
---     exfalso;
---     apply na;
---     exact a.
+theorem explode A B : A -> not A -> B := by
+    intro a; intro na;
+    exfalso;
+    apply na;
+    exact a.
 
 axiom excluded_middle A : A or not A.
 

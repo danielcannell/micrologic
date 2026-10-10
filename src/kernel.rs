@@ -412,7 +412,7 @@ pub enum Term {
 }
 
 impl Term {
-    fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         match self {
             Term::Var { span, .. } => *span,
             Term::Lambda { span, .. } => *span,
@@ -723,8 +723,14 @@ fn infer(ctx: &Context, term: &Term, trust: &mut Trust) -> Result<Type> {
     }
 }
 
-/// A `Var` was given the wrong number of type arguments.
-fn type_arity_error(name: &str, scheme: &Scheme, mismatch: ArityMismatch, at: Span) -> Diagnostic {
+/// A `Var` was given the wrong number of type arguments. Public so the tactic elaborator can word
+/// the same mistake the same way.
+pub fn type_arity_error(
+    name: &str,
+    scheme: &Scheme,
+    mismatch: ArityMismatch,
+    at: Span,
+) -> Diagnostic {
     let ArityMismatch { expected, found } = mismatch;
     let diag = if expected == 0 {
         Diagnostic::error(format!("`{name}` takes no type arguments"), at)

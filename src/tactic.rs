@@ -64,6 +64,10 @@ pub enum Tactic {
         hypothesis: Name,
         typ: kernel::Type,
     },
+    Apply {
+        span: Span,
+        term: kernel::Term,
+    },
 }
 
 impl Tactic {
@@ -81,6 +85,7 @@ impl Tactic {
             Tactic::Destruct { span, .. } => *span,
             Tactic::Cases { span, .. } => *span,
             Tactic::Have { span, .. } => *span,
+            Tactic::Apply { span, .. } => *span,
         }
     }
 }
@@ -211,13 +216,8 @@ fn hidden_note(hidden: &Local) -> String {
     )
 }
 
-/// `exact` was given a term that mentions a name that isn't in scope at this goal.
-fn unknown_name_in_exact(
-    name: &str,
-    span: Span,
-    goal: &Goal,
-    proof_state: &ProofState,
-) -> Diagnostic {
+/// A tactic's term (in `exact` or `apply`) mentions a name that isn't in scope at this goal.
+fn unknown_name(name: &str, span: Span, goal: &Goal, proof_state: &ProofState) -> Diagnostic {
     let mut diag = Diagnostic::error(format!("cannot find `{name}` in this scope"), span)
         .with_primary_label("not a hypothesis, theorem or axiom");
 
@@ -623,7 +623,7 @@ fn elaborate_focus(
                 // where the goal is known and can be shown.
                 for (name, name_span) in free_names(term) {
                     if goal.lookup_local_by_name(name).is_none() && ctx.lookup(name).is_none() {
-                        return Err(unknown_name_in_exact(name, name_span, &goal, proof_state));
+                        return Err(unknown_name(name, name_span, &goal, proof_state));
                     }
                 }
 
@@ -911,6 +911,99 @@ fn elaborate_focus(
                     }),
                     argument: Box::new(Partial::Hole { goal_id: h_goal_id }),
                 };
+
+                proof_state.add_solution(goal.id, solution);
+            }
+            Tactic::Apply { span, term } => {
+                // Only a name for now: its type comes from the goal or the context. Any other
+                // term would need type inference.
+                let kernel::Term::Var {
+                    span: name_span,
+                    name,
+                    type_arguments,
+                } = term
+                else {
+                    return Err(Diagnostic::error(
+                        "`apply` needs a hypothesis or theorem name",
+                        term.span(),
+                    )
+                    .with_primary_label("not a name")
+                    .with_note(
+                        "to apply a more complex term, give it a name first: \
+                         `have h : T; { exact <term> }; apply h`",
+                    ));
+                };
+
+                // Locals first, as in the kernel.
+                let function_type = if let Some(local) = goal.lookup_local_by_name(name) {
+                    if !type_arguments.is_empty() {
+                        return Err(Diagnostic::error(
+                            format!("`{name}` takes no type arguments"),
+                            *name_span,
+                        )
+                        .with_primary_label(format!(
+                            "{} supplied",
+                            kernel::count(type_arguments.len(), "type argument")
+                        ))
+                        .with_note(format!(
+                            "`{name}` is a hypothesis; only theorems and axioms take type arguments"
+                        ))
+                        .with_note(goal_note(&goal)));
+                    }
+                    local.typ.clone()
+                } else if let Some((scheme, _)) = ctx.lookup(name) {
+                    scheme.instantiate(type_arguments).map_err(|mismatch| {
+                        kernel::type_arity_error(name, scheme, mismatch, *name_span)
+                            .with_note(goal_note(&goal))
+                    })?
+                } else {
+                    return Err(unknown_name(name, *name_span, &goal, proof_state));
+                };
+
+                // `f : P1 -> ... -> Pn -> C` proves the goal `C` from proofs of `P1` ... `Pn`. Take
+                // the smallest `n` that works, so that `f : A -> B -> C` on the goal `B -> C`
+                // leaves just `A`.
+                let mut premises = Vec::new();
+                let mut conclusion = &function_type;
+                while *conclusion != goal.target {
+                    let kernel::Type::Lambda {
+                        argument_type,
+                        result_type,
+                    } = conclusion
+                    else {
+                        return Err(Diagnostic::error(
+                            format!("`apply` can't use `{name}` to prove `{}`", goal.target),
+                            *name_span,
+                        )
+                        .with_primary_label(format!("`{name}` has type `{function_type}`"))
+                        .with_note(format!(
+                            "`apply {name}` needs `{name}` to have type `{target}`, or \
+                             `P -> {target}`, `P -> Q -> {target}` and so on",
+                            target = goal.target
+                        ))
+                        .with_note(goal_note(&goal)));
+                    };
+                    premises.push((**argument_type).clone());
+                    conclusion = result_type;
+                }
+
+                // Push the premises last first, so the first premise is the next goal.
+                let mut premise_goal_ids: Vec<GoalId> = premises
+                    .into_iter()
+                    .rev()
+                    .map(|premise| proof_state.push_new_goal(goal.locals.clone(), premise))
+                    .collect();
+                premise_goal_ids.reverse();
+
+                // `f ?1 ... ?n`
+                let solution = premise_goal_ids.into_iter().fold(
+                    Partial::Term { term: term.clone() },
+                    |function, goal_id| Partial::Application {
+                        span: *span,
+                        function: Box::new(function),
+                        argument: Box::new(Partial::Hole { goal_id }),
+                    },
+                );
 
                 proof_state.add_solution(goal.id, solution);
             }
@@ -1625,6 +1718,166 @@ mod tests {
             vec![
                 "the goal is\na : A\nb : B\n⊢ B",
                 "a `{ ... }` block must prove its goal before the `}`",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_apply() {
+        // One premise becomes one goal.
+        assert_eq!(
+            elaborate_str(
+                "theorem t A B : (A -> B) -> A -> B := by intro f; intro a; apply f; exact a."
+            ),
+            "(fun f [A -> B] (fun a [A] (app f a)))"
+        );
+        // Several premises become goals in order, first premise first.
+        assert_eq!(
+            elaborate_str(
+                "theorem t A B C : (A -> B -> C) -> A -> B -> C := by \
+                 intro f; intro a; intro b; apply f; exact a; exact b."
+            ),
+            "(fun f [A -> B -> C] (fun a [A] (fun b [B] (app (app f a) b))))"
+        );
+        // A hypothesis that already proves the goal leaves no goals, like `exact`.
+        assert_eq!(
+            elaborate_str("theorem t A : A -> A := by intro a; apply a."),
+            "(fun a [A] a)"
+        );
+    }
+
+    #[test]
+    fn test_apply_uses_as_few_premises_as_possible() {
+        // On the goal `B -> C`, `f : A -> B -> C` needs only `A`.
+        assert_eq!(
+            elaborate_str(
+                "theorem t A B C : (A -> B -> C) -> A -> B -> C := by \
+                 intro f; intro a; apply f; exact a."
+            ),
+            "(fun f [A -> B -> C] (fun a [A] (app f a)))"
+        );
+    }
+
+    #[test]
+    fn test_apply_negation() {
+        // `not B` is `B -> False`, so applying it to the goal `False` leaves `B`.
+        assert_eq!(
+            elaborate_str(
+                "theorem t A B : (A -> B) -> not B -> not A := by \
+                 intro f; intro nb; intro a; apply nb; apply f; exact a."
+            ),
+            "(fun f [A -> B] (fun nb [not B] (fun a [A] (app nb (app f a)))))"
+        );
+    }
+
+    #[test]
+    fn test_apply_uses_the_visible_hypothesis() {
+        // The later `f` hides the earlier one.
+        assert_eq!(
+            elaborate_str(
+                "theorem t A B : (B -> A) -> (A -> B) -> A -> B := by \
+                 intro f; intro f; intro a; apply f; exact a."
+            ),
+            "(fun f [B -> A] (fun f [A -> B] (fun a [A] (app f a))))"
+        );
+    }
+
+    #[test]
+    fn test_apply_theorems_and_axioms() {
+        // Theorems and axioms need their type arguments; the terms must pass the kernel too.
+        let summary = crate::process_module(
+            r#"
+            theorem id A : A -> A := fun (x : A) => x.
+            axiom mp A B : A -> (A -> B) -> B.
+            theorem use_id B : B -> B := by apply id [B].
+            theorem use_mp A B : A -> (A -> B) -> B := by
+                intro a; intro f; apply mp [A] [B]; { exact a }; { exact f }.
+            theorem compound A B : (A -> B) -> A -> B := by
+                intro f; intro a; apply id [A -> B]; { exact f }; { exact a }.
+            "#,
+        )
+        .unwrap_or_else(|diag| panic!("should accept, but got `{}`", diag.message));
+        assert_eq!((summary.proved, summary.admitted), (4, 0));
+    }
+
+    #[test]
+    fn test_apply_leaves_premises_as_goals() {
+        let source = "theorem t A B C : (A -> B -> C) -> C := by intro f; apply f.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "2 unsolved goals");
+        assert_eq!(
+            diag.notes,
+            vec![
+                "goal 1 of 2 is\nf : A -> B -> C\n⊢ A",
+                "goal 2 of 2 is\nf : A -> B -> C\n⊢ B",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_apply_errors() {
+        // The conclusion doesn't match the goal.
+        let source = "theorem t A B : (A -> B) -> A -> A := by intro f; intro a; apply f; exact a.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "`apply` can't use `f` to prove `A`");
+        assert_eq!(
+            primary_label(source, &diag),
+            ("f".to_string(), "`f` has type `A -> B`".to_string())
+        );
+        assert_eq!(
+            diag.notes,
+            vec![
+                "`apply f` needs `f` to have type `A`, or `P -> A`, `P -> Q -> A` and so on",
+                "the goal is\nf : A -> B\na : A\n⊢ A",
+            ]
+        );
+
+        // Not a name.
+        let source = "theorem t A : A -> A := by intro a; apply (fun (x : A) => x) a.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "`apply` needs a hypothesis or theorem name");
+        assert_eq!(
+            primary_label(source, &diag),
+            ("(fun (x : A) => x) a".to_string(), "not a name".to_string())
+        );
+
+        // An unknown name.
+        let source = "theorem t A : A -> A := by intro a; apply g.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "cannot find `g` in this scope");
+        assert_eq!(
+            primary_label(source, &diag),
+            (
+                "g".to_string(),
+                "not a hypothesis, theorem or axiom".to_string()
+            )
+        );
+
+        // Type arguments on a hypothesis.
+        let source = "theorem t A : A -> A := by intro a; apply a [A].";
+        let diag = reject(source);
+        assert_eq!(diag.message, "`a` takes no type arguments");
+        assert_eq!(
+            diag.notes,
+            vec![
+                "`a` is a hypothesis; only theorems and axioms take type arguments",
+                "the goal is\na : A\n⊢ A",
+            ]
+        );
+
+        // Missing type arguments on a theorem: worded as in the kernel.
+        let diag = reject(
+            "theorem id A : A -> A := fun (x : A) => x.\ntheorem t B : B -> B := by apply id.",
+        );
+        assert_eq!(
+            diag.message,
+            "`id` takes 1 type argument but 0 were supplied"
+        );
+        assert_eq!(
+            diag.notes,
+            vec![
+                "`id` has type parameters `A`; supply one type for each: `id [A]`",
+                "the goal is\n⊢ B -> B",
             ]
         );
     }

@@ -6,9 +6,24 @@
 // theorem     := "theorem" IDENT IDENT* ':' type ':=' theorem_body '.'
 // proposition := "proposition" IDENT IDENT* ':=' type '.'
 //
-// theorem_body := "by" script | term
-// script       := (tactic (';' tactic)*)?
-// tactic       := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso" | "destruct" IDENT "as" IDENT IDENT | "cases" IDENT "as" IDENT IDENT | "have" IDENT ':' type
+// theorem_body      := "by" script | term
+// script            := (tactic (';' tactic)*)?
+// tactic            := tactic_focus | tactic_intro | tactic_exact | tactic_split | tactic_left |
+//                      tactic_right | tactic_assumption | tactic_admit | tactic_exfalso |
+//                      tactic_destruct | tactic_cases | tactic_have | tactic_apply
+// tactic_focus      := '{' script '}'
+// tactic_intro      := "intro" IDENT
+// tactic_exact      := "exact" term
+// tactic_split      := "split"
+// tactic_left       := "left"
+// tactic_right      := "right"
+// tactic_assumption := "assumption"
+// tactic_admit      := "admit"
+// tactic_exfalso    := "exfalso"
+// tactic_destruct   := "destruct" IDENT "as" IDENT IDENT
+// tactic_cases      := "cases" IDENT "as" IDENT IDENT
+// tactic_have       := "have" IDENT ':' type
+// tactic_apply      := "apply" term
 //
 // type        := type_lambda ("<->" type)?
 // type_lambda := type_or ("->" type)?
@@ -101,6 +116,7 @@ pub mod ast {
         Destruct(Destruct),
         Cases(Cases),
         Have(Have),
+        Apply(Apply),
     }
 
     impl Tactic {
@@ -118,6 +134,7 @@ pub mod ast {
                 Tactic::Destruct(destruct) => destruct.span,
                 Tactic::Cases(cases) => cases.span,
                 Tactic::Have(have) => have.span,
+                Tactic::Apply(apply) => apply.span,
             }
         }
     }
@@ -191,6 +208,12 @@ pub mod ast {
         pub span: Span,
         pub hypothesis: Ident,
         pub typ: Type,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Apply {
+        pub span: Span,
+        pub term: Term,
     }
 
     /// `proposition name params : type .`
@@ -767,9 +790,24 @@ impl<'source> Parser<'source> {
         })
     }
 
-    // tactic := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso" | "destruct" IDENT "as" IDENT IDENT | "cases" IDENT "as" IDENT IDENT | "have" IDENT ':' type
+    // tactic            := tactic_focus | tactic_intro | tactic_exact | tactic_split | tactic_left |
+    //                      tactic_right | tactic_assumption | tactic_admit | tactic_exfalso |
+    //                      tactic_destruct | tactic_cases | tactic_have | tactic_apply
+    // tactic_focus      := '{' script '}'
+    // tactic_intro      := "intro" IDENT
+    // tactic_exact      := "exact" term
+    // tactic_split      := "split"
+    // tactic_left       := "left"
+    // tactic_right      := "right"
+    // tactic_assumption := "assumption"
+    // tactic_admit      := "admit"
+    // tactic_exfalso    := "exfalso"
+    // tactic_destruct   := "destruct" IDENT "as" IDENT IDENT
+    // tactic_cases      := "cases" IDENT "as" IDENT IDENT
+    // tactic_have       := "have" IDENT ':' type
+    // tactic_apply      := "apply" term
     fn parse_tactic(&mut self) -> Result<ast::Tactic> {
-        const KNOWN_TACTICS: &str = "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption`, `admit`, `exfalso`, `destruct`, `cases` and `have`";
+        const KNOWN_TACTICS: &str = "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption`, `admit`, `exfalso`, `destruct`, `cases`, `have` and `apply`";
 
         let start = self.current.span;
 
@@ -859,6 +897,13 @@ impl<'source> Parser<'source> {
                     span: self.span_from(start),
                     hypothesis,
                     typ,
+                }))
+            }
+            "apply" => {
+                let term = self.parse_term()?;
+                Ok(ast::Tactic::Apply(ast::Apply {
+                    span: self.span_from(start),
+                    term,
                 }))
             }
             _ => Err(Diagnostic::error(format!("unknown tactic `{name}`"), start)
@@ -1579,6 +1624,7 @@ mod tests {
             ast::Tactic::Have(have) => {
                 format!("(have {} {})", have.hypothesis.text, show_type(&have.typ))
             }
+            ast::Tactic::Apply(apply) => format!("(apply {})", show_term(&apply.term)),
         }
     }
 
@@ -1902,6 +1948,7 @@ mod tests {
             parse_body_str("by have h : A or not A; exact h"),
             "(script (have h (or A (not A))) (exact h))"
         );
+        assert_eq!(parse_body_str("by apply a [A]"), "(script (apply (a [A])))");
         // The type after `have` ends at `}` and `.` too.
         assert_eq!(
             parse_body_str("by { have h : A -> B }"),
@@ -2010,7 +2057,7 @@ mod tests {
             diag.notes,
             vec![
                 "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption`, \
-                 `admit`, `exfalso`, `destruct`, `cases` and `have`"
+                 `admit`, `exfalso`, `destruct`, `cases`, `have` and `apply`"
             ]
         );
 
@@ -2058,6 +2105,10 @@ mod tests {
         let diag = parse_error("theorem t : A := by have h : ; exact h.");
         assert_eq!(diag.message, "expected a type, found `;`");
         assert!(parse("theorem t : A := by have : A.").is_err());
+
+        // `apply` needs a term.
+        let diag = parse_error("theorem t : A := by apply.");
+        assert_eq!(diag.message, "expected a term, found `.`");
     }
 
     #[test]
