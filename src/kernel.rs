@@ -817,6 +817,54 @@ fn check_against(
         }
 
         (
+            Term::Inl {
+                span,
+                right_type,
+                left,
+            },
+            Type::Either {
+                left_type: expected_left_type,
+                right_type: expected_right_type,
+            },
+        ) => {
+            if right_type != &**expected_right_type {
+                return Err(wrong_injection_annotation(
+                    "inl",
+                    "right",
+                    right_type,
+                    expected_right_type,
+                    *span,
+                    statement,
+                ));
+            }
+            check_against(ctx, left, expected_left_type, statement, trust)
+        }
+
+        (
+            Term::Inr {
+                span,
+                left_type,
+                right,
+            },
+            Type::Either {
+                left_type: expected_left_type,
+                right_type: expected_right_type,
+            },
+        ) => {
+            if left_type != &**expected_left_type {
+                return Err(wrong_injection_annotation(
+                    "inr",
+                    "left",
+                    left_type,
+                    expected_left_type,
+                    *span,
+                    statement,
+                ));
+            }
+            check_against(ctx, right, expected_right_type, statement, trust)
+        }
+
+        (
             Term::Case {
                 either,
                 left_name,
@@ -860,6 +908,26 @@ fn check_against(
             }
         }
     }
+}
+
+/// `inl [R] t` (or `inr [L] t`) checked against `A or B` where the annotation isn't the expected
+/// side: `injection` is `"inl"` or `"inr"`, and `side` is the side its annotation gives.
+fn wrong_injection_annotation(
+    injection: &str,
+    side: &str,
+    annotation: &Type,
+    expected: &Type,
+    span: Span,
+    statement: Span,
+) -> Diagnostic {
+    Diagnostic::error(
+        format!("`{injection}` is annotated with the wrong {side} side"),
+        span,
+    )
+    .with_primary_label(format!(
+        "the {side} side is annotated as `{annotation}`, but `{expected}` is expected"
+    ))
+    .with_label(statement, "expected because of this statement")
 }
 
 #[cfg(test)]
@@ -1205,6 +1273,88 @@ mod tests {
         assert_eq!(
             check(&admitted, &body, &goal, NO_SPAN).unwrap(),
             Trust::Admitted
+        );
+    }
+
+    fn inl(right_type: Type, left: Term) -> Term {
+        Term::Inl {
+            span: NO_SPAN,
+            right_type,
+            left: Box::new(left),
+        }
+    }
+
+    fn inr(left_type: Type, right: Term) -> Term {
+        Term::Inr {
+            span: NO_SPAN,
+            left_type,
+            right: Box::new(right),
+        }
+    }
+
+    #[test]
+    fn test_injections_are_checked_against_the_expected_disjunction() {
+        // theorem t A B : A -> A or B := fun (a : A) => inl [B] a
+        let goal = scheme(&["A", "B"], arrow(atom("A"), or(atom("A"), atom("B"))));
+        let body = lam("a", atom("A"), inl(atom("B"), var("a", vec![])));
+        assert_eq!(
+            check(&Context::new(), &body, &goal, NO_SPAN).unwrap(),
+            Trust::Proved
+        );
+
+        // theorem t A B : B -> A or (A -> B) := fun (b : B) => inr [A] (fun (a : A) => b)
+        let goal = scheme(
+            &["A", "B"],
+            arrow(atom("B"), or(atom("A"), arrow(atom("A"), atom("B")))),
+        );
+        let body = lam(
+            "b",
+            atom("B"),
+            inr(atom("A"), lam("a", atom("A"), var("b", vec![]))),
+        );
+        assert_eq!(
+            check(&Context::new(), &body, &goal, NO_SPAN).unwrap(),
+            Trust::Proved
+        );
+    }
+
+    #[test]
+    fn test_injection_mismatch_is_reported_inside() {
+        // theorem bad A : A or not A := inr [A] (fun (a : A) => a)
+        // The expected type is pushed through `inr` and the lambda, so the mistake is found at
+        // `a`, which should prove `False`.
+        let goal = scheme(&["A"], or(atom("A"), not(atom("A"))));
+        let body = inr(atom("A"), lam("a", atom("A"), var("a", vec![])));
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "mismatched types: expected `False`, found `A`"
+        );
+
+        // theorem bad A B : B -> A or B := fun (b : B) => inl [B] b
+        let goal = scheme(&["A", "B"], arrow(atom("B"), or(atom("A"), atom("B"))));
+        let body = lam("b", atom("B"), inl(atom("B"), var("b", vec![])));
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "mismatched types: expected `A`, found `B`"
+        );
+    }
+
+    #[test]
+    fn test_injection_with_wrong_annotation() {
+        // theorem bad A B : A -> A or B := fun (a : A) => inl [A] a
+        let goal = scheme(&["A", "B"], arrow(atom("A"), or(atom("A"), atom("B"))));
+        let body = lam("a", atom("A"), inl(atom("A"), var("a", vec![])));
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "`inl` is annotated with the wrong right side"
+        );
+
+        // theorem bad A B : B -> A or B := fun (b : B) => inr [B] b
+        let goal = scheme(&["A", "B"], arrow(atom("B"), or(atom("A"), atom("B"))));
+        let body = lam("b", atom("B"), inr(atom("B"), var("b", vec![])));
+        assert_eq!(
+            error_message(check(&Context::new(), &body, &goal, NO_SPAN)),
+            "`inr` is annotated with the wrong left side"
         );
     }
 }

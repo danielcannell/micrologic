@@ -428,9 +428,15 @@ mod tests {
     use crate::diagnostics::Diagnostic;
     use crate::surface::ast::Item;
 
+    // A theorem's lowered body: a term, or a tactic script.
+    enum LoweredBody {
+        Term(kernel::Term),
+        Script(tactic::Script),
+    }
+
     // Lower every item in `source` in order, building the alias table as the driver does. Returns
     // the first error, or else the lowered type and body of the last theorem.
-    fn lower_module(source: &str) -> Result<(kernel::Type, kernel::Term)> {
+    fn lower_module_body(source: &str) -> Result<(kernel::Type, LoweredBody)> {
         let module = surface::parse(source).expect("should parse");
         let mut aliases = HashMap::new();
         let mut last = None;
@@ -455,10 +461,13 @@ mod tests {
                     lower_type_parameters(&theorem.parameters)?;
                     let typ = lower_type(&theorem.typ, &scope)?;
                     let body = match &theorem.body {
-                        surface::ast::Body::Term(body) => body,
-                        _ => todo!(),
+                        surface::ast::Body::Term(term) => {
+                            LoweredBody::Term(lower_term(term, &scope)?)
+                        }
+                        surface::ast::Body::Script(script) => {
+                            LoweredBody::Script(lower_script(script, &scope)?)
+                        }
                     };
-                    let body = lower_term(body, &scope)?;
                     last = Some((typ, body));
                 }
                 Item::Proposition(proposition) => {
@@ -476,6 +485,23 @@ mod tests {
         }
 
         Ok(last.expect("source should contain a theorem"))
+    }
+
+    // As `lower_module_body`, for a last theorem proved by a term.
+    fn lower_module(source: &str) -> Result<(kernel::Type, kernel::Term)> {
+        match lower_module_body(source)? {
+            (typ, LoweredBody::Term(term)) => Ok((typ, term)),
+            (_, LoweredBody::Script(_)) => panic!("expected a term body:\n{source}"),
+        }
+    }
+
+    // As `lower_module_body`, for a last theorem proved by a tactic script.
+    fn lower_module_script(source: &str) -> tactic::Script {
+        match lower_module_body(source) {
+            Ok((_, LoweredBody::Script(script))) => script,
+            Ok((_, LoweredBody::Term(_))) => panic!("expected a tactic script:\n{source}"),
+            Err(diag) => panic!("failed to lower: {}\n{source}", diag.message),
+        }
     }
 
     // Lower the type of `theorem t A B C : <typ> := x.` after the definitions in `defs`.
@@ -497,7 +523,7 @@ mod tests {
 
     // The error from lowering `source`, and the source text under its primary label.
     fn lower_error(source: &str) -> (String, String) {
-        let diag: Diagnostic = match lower_module(source) {
+        let diag: Diagnostic = match lower_module_body(source) {
             Ok(_) => panic!("expected `{source}` to fail to lower"),
             Err(diag) => diag,
         };
@@ -744,5 +770,71 @@ mod tests {
             lower_notes(&source),
             vec!["`Statement` is defined with parameters `A`, `S`"]
         );
+    }
+
+    #[test]
+    fn test_script_lowering() {
+        let script = lower_module_script(
+            "theorem t A : A -> A := by intro h; split; left; right; assumption; admit; exact h.",
+        );
+        let names: Vec<&str> = script
+            .tactics
+            .iter()
+            .map(|tactic| match tactic {
+                tactic::Tactic::Intro { name, .. } => name.as_str(),
+                tactic::Tactic::Exact { .. } => "exact",
+                tactic::Tactic::Split { .. } => "split",
+                tactic::Tactic::Left { .. } => "left",
+                tactic::Tactic::Right { .. } => "right",
+                tactic::Tactic::Assumption { .. } => "assumption",
+                tactic::Tactic::Admit { .. } => "admit",
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "h",
+                "split",
+                "left",
+                "right",
+                "assumption",
+                "admit",
+                "exact"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unbound_name_in_script() {
+        // Types inside an `exact` term are resolved like any other term's.
+        assert_eq!(
+            lower_error("theorem t A : A -> A or A := by intro a; exact inl [Q] a."),
+            unbound("Q")
+        );
+        assert_eq!(
+            lower_error("theorem t A : A -> A := by exact fun (x : Q) => x."),
+            unbound("Q")
+        );
+        // Even after an earlier tactic that is fine.
+        assert_eq!(
+            lower_error("theorem t A : A -> A := by intro a; split; exact absurd [Q] a."),
+            unbound("Q")
+        );
+    }
+
+    #[test]
+    fn test_alias_in_script() {
+        let source =
+            format!("{KNIGHTS_AND_KNAVES}\ntheorem t A : A := by exact fun (x : Knave A) => x.");
+        let script = lower_module_script(&source);
+        match &script.tactics[..] {
+            [
+                tactic::Tactic::Exact {
+                    term: kernel::Term::Lambda { argument_type, .. },
+                    ..
+                },
+            ] => assert_eq!(*argument_type, lower_type_str("", "not A")),
+            _ => panic!("expected a single `exact` of a lambda"),
+        }
     }
 }

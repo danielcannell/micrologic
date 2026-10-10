@@ -195,6 +195,7 @@ mod tests {
     fn test_examples() {
         assert_all_proved(include_str!("../examples/example.ml"));
         assert_all_proved(include_str!("../examples/knights_and_knaves.ml"));
+        assert_all_proved(include_str!("../examples/tactics.ml"));
     }
 
     #[test]
@@ -414,6 +415,38 @@ mod tests {
     }
 
     #[test]
+    fn test_mismatch_inside_an_injection() {
+        // The expected type is pushed through `inl`/`inr`, so the error points at the wrong
+        // sub-term, not the whole injection.
+        let statement = pair("A or not A", "expected because of this statement");
+        assert_eq!(
+            labels("theorem t A : A or not A := inr [A] (fun (a : A) => a)."),
+            vec![pair("a", "this has type `A`"), statement.clone()]
+        );
+        let source = "theorem t A : A or not A := by right; intro a; exact a.";
+        assert_eq!(
+            labels(source),
+            vec![pair("a", "this has type `A`"), statement]
+        );
+        assert_eq!(
+            reject(source).labels[0].span.start,
+            source.find("exact a").unwrap() + "exact ".len()
+        );
+
+        // A wrong annotation is reported at the injection.
+        assert_eq!(
+            labels("theorem t A B : A -> A or B := fun (a : A) => inl [A] a."),
+            vec![
+                pair(
+                    "inl [A] a",
+                    "the right side is annotated as `A`, but `B` is expected"
+                ),
+                pair("A -> A or B", "expected because of this statement"),
+            ]
+        );
+    }
+
+    #[test]
     fn test_errors_unrelated_to_the_statement_do_not_point_at_it() {
         assert_eq!(
             labels("theorem t A B : (A -> B) -> B -> B := fun (f : A -> B) => fun (b : B) => f b."),
@@ -451,6 +484,110 @@ mod tests {
         assert_eq!(
             diag.notes,
             vec!["`swap` has type parameters `A`, `B`; supply one type for each: `swap [A] [B]`"]
+        );
+    }
+
+    #[test]
+    fn test_tactic_proofs_and_term_proofs_mix() {
+        // Tactic proofs can use term proofs via `exact`, and vice versa.
+        assert_all_proved(
+            r#"
+            theorem swap A B : A and B -> B and A := fun (p : A and B) => (snd p, fst p).
+            theorem swap_tactic A B : A and B -> B and A := by intro p; exact swap [A] [B] p.
+            theorem pair_tactic A B : A -> B -> A and B := by
+                intro a; intro b; split; exact a; exact b.
+            theorem pair_swapped A B : A -> B -> B and A :=
+                fun (a : A) => fun (b : B) => swap_tactic [A] [B] (pair_tactic [A] [B] a b).
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_wrong_exact_is_rejected_by_the_kernel() {
+        // The elaborator doesn't check `exact` terms; the kernel does, and labels the mistake
+        // inside the term rather than at the tactic.
+        let source =
+            "theorem t A B : A -> B -> B and A := by intro a; intro b; split; exact a; exact b.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "mismatched types: expected `B`, found `A`");
+        assert_eq!(
+            labels(source),
+            vec![
+                pair("a", "this has type `A`"),
+                pair("A -> B -> B and A", "expected because of this statement"),
+            ]
+        );
+        assert_eq!(
+            diag.labels[0].span.start,
+            source.find("exact a").unwrap() + "exact ".len()
+        );
+    }
+
+    #[test]
+    fn test_non_theorems_are_rejected_with_tactics() {
+        // Whether the elaborator or the kernel catches it, a tactic script can't prove a
+        // non-theorem.
+        let attempts = [
+            (
+                "theorem bad A B : A -> B := by intro a; exact a.",
+                "mismatched types: expected `B`, found `A`",
+            ),
+            (
+                "theorem bad A B : A -> B := by intro a; assumption.",
+                "no hypothesis matches the goal",
+            ),
+            (
+                "theorem bad A : not not A -> A := by intro h; exact h.",
+                "mismatched types: expected `A`, found `not not A`",
+            ),
+            (
+                "theorem bad A : A or not A := by left; assumption.",
+                "no hypothesis matches the goal",
+            ),
+            (
+                "theorem bad A : A or not A := by right; intro a; exact a.",
+                "mismatched types: expected `False`, found `A`",
+            ),
+            // The second `h` hides the first, so `exact h` refers to `h : B`.
+            (
+                "theorem bad A B : A -> B -> A := by intro h; intro h; exact h.",
+                "mismatched types: expected `A`, found `B`",
+            ),
+        ];
+        for (source, message) in attempts {
+            assert_eq!(reject(source).message, message, "in:\n{source}");
+        }
+    }
+
+    #[test]
+    fn test_admit() {
+        // An admitted theorem is accepted (so the exit code is 0), but not counted as proved.
+        assert_eq!(
+            accept("theorem t A B : A -> B := by intro a; admit."),
+            Summary {
+                proved: 0,
+                admitted: 1
+            }
+        );
+    }
+
+    #[test]
+    fn test_admit_taints_transitively() {
+        // Taint flows through `exact` in tactic proofs and into term proofs.
+        let summary = accept(
+            r#"
+            theorem hole A B : A -> B := by intro a; admit.
+            theorem user A B : A -> B := by exact hole [A] [B].
+            theorem term_user A B : A -> B := fun (a : A) => user [A] [B] a.
+            theorem independent A : A -> A := by intro a; exact a.
+            "#,
+        );
+        assert_eq!(
+            summary,
+            Summary {
+                proved: 1,
+                admitted: 3
+            }
         );
     }
 }
