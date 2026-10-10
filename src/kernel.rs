@@ -1085,7 +1085,7 @@ mod tests {
     #[test]
     fn test_instantiate_with_compound_type() {
         let a_to_a = arrow(atom("A"), atom("A"));
-        let instantiated = id_scheme().instantiate(&[a_to_a.clone()]).unwrap();
+        let instantiated = id_scheme().instantiate(std::slice::from_ref(&a_to_a)).unwrap();
         assert_eq!(instantiated, arrow(a_to_a.clone(), a_to_a));
     }
 
