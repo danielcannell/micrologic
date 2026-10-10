@@ -49,8 +49,6 @@ theorem puzzle1' Alice Bob : Puzzle1 Alice Bob <-> (Knave Alice and Knight Bob) 
         -- If Alice's statement is consistent, then Alice is a knave and Bob is a knight
 
         -- Split Alice's statement into the knight and knave cases
-        --   if_knight : Knight Alice ->      Knave Alice and Knave Bob
-        --   if_knave  : Knave  Alice -> not (Knave Alice and Knave Bob)
         intro statement;
         destruct statement as if_knight if_knave;
 
