@@ -8,7 +8,7 @@
 //
 // theorem_body := "by" script | term
 // script       := tactic (';' tactic)*
-// tactic       := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso"
+// tactic       := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso" | "destruct" IDENT "as" IDENT IDENT
 //
 // type        := type_lambda ("<->" type)?
 // type_lambda := type_or ("->" type)?
@@ -98,6 +98,7 @@ pub mod ast {
         Assumption(Assumption),
         Admit(Admit),
         ExFalso(ExFalso),
+        Destruct(Destruct),
     }
 
     impl Tactic {
@@ -112,6 +113,7 @@ pub mod ast {
                 Tactic::Assumption(assumption) => assumption.span,
                 Tactic::Admit(admit) => admit.span,
                 Tactic::ExFalso(ex_false) => ex_false.span,
+                Tactic::Destruct(destruct) => destruct.span,
             }
         }
     }
@@ -162,6 +164,14 @@ pub mod ast {
     #[derive(Debug, Clone)]
     pub struct ExFalso {
         pub span: Span,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Destruct {
+        pub span: Span,
+        pub hypothesis: Ident,
+        pub left: Ident,
+        pub right: Ident,
     }
 
     /// `proposition name params : type .`
@@ -398,6 +408,7 @@ pub enum TokenKind {
     Absurd,      // "absurd"
     TrustMe,     // "trustme"
     By,          // "by"
+    As,          // "as"
 
     // Delimiters
     LeftParen,    // '('
@@ -544,6 +555,7 @@ impl<'source> Lexer<'source> {
                         "absurd" => TokenKind::Absurd,
                         "trustme" => TokenKind::TrustMe,
                         "by" => TokenKind::By,
+                        "as" => TokenKind::As,
                         _ => TokenKind::Ident,
                     }
                 }
@@ -724,9 +736,9 @@ impl<'source> Parser<'source> {
         })
     }
 
-    // tactic := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso"
+    // tactic := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso" | "destruct" IDENT "as" IDENT IDENT
     fn parse_tactic(&mut self) -> Result<ast::Tactic> {
-        const KNOWN_TACTICS: &str = "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption` and `admit`";
+        const KNOWN_TACTICS: &str = "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption`, `admit`, `exfalso` and `destruct`";
 
         let start = self.current.span;
 
@@ -784,6 +796,18 @@ impl<'source> Parser<'source> {
             "exfalso" => Ok(ast::Tactic::ExFalso(ast::ExFalso {
                 span: self.span_from(start),
             })),
+            "destruct" => {
+                let hypothesis = self.parse_ident()?;
+                self.expect_token(TokenKind::As)?;
+                let left = self.parse_ident()?;
+                let right = self.parse_ident()?;
+                Ok(ast::Tactic::Destruct(ast::Destruct {
+                    span: self.span_from(start),
+                    hypothesis,
+                    left,
+                    right,
+                }))
+            }
             _ => Err(Diagnostic::error(format!("unknown tactic `{name}`"), start)
                 .with_primary_label("unknown tactic")
                 .with_note(KNOWN_TACTICS)),
@@ -1336,6 +1360,7 @@ fn is_keyword(kind: TokenKind) -> bool {
             | TokenKind::Absurd
             | TokenKind::TrustMe
             | TokenKind::By
+            | TokenKind::As
     )
 }
 
@@ -1360,6 +1385,7 @@ fn describe(kind: TokenKind) -> &'static str {
         TokenKind::Absurd => "`absurd`",
         TokenKind::TrustMe => "`trustme`",
         TokenKind::By => "`by`",
+        TokenKind::As => "`as`",
         TokenKind::LeftParen => "`(`",
         TokenKind::RightParen => "`)`",
         TokenKind::LeftBracket => "`[`",
@@ -1488,6 +1514,11 @@ mod tests {
             ast::Tactic::Right(_) => "right".to_string(),
             ast::Tactic::Assumption(_) => "assumption".to_string(),
             ast::Tactic::Admit(_) => "admit".to_string(),
+            ast::Tactic::ExFalso(_) => "exfalso".to_string(),
+            ast::Tactic::Destruct(destruct) => format!(
+                "(destruct {} {} {})",
+                destruct.hypothesis.text, destruct.left.text, destruct.right.text
+            ),
         }
     }
 
@@ -1792,6 +1823,53 @@ mod tests {
     }
 
     #[test]
+    fn test_more_tactics() {
+        assert_eq!(parse_body_str("by exfalso"), "(script exfalso)");
+        assert_eq!(
+            parse_body_str("by destruct h as a b"),
+            "(script (destruct h a b))"
+        );
+        // The parts can reuse the hypothesis's name.
+        assert_eq!(
+            parse_body_str("by destruct h as h h"),
+            "(script (destruct h h h))"
+        );
+    }
+
+    #[test]
+    fn test_focus() {
+        assert_eq!(
+            parse_body_str("by split; { exact a }; { exact b }"),
+            "(script split (focus (script (exact a))) (focus (script (exact b))))"
+        );
+        // Blocks nest, and can hold several tactics.
+        assert_eq!(
+            parse_body_str("by split; { split; { exact a }; exact b }; exact c"),
+            "(script split (focus (script split (focus (script (exact a))) (exact b))) (exact c))"
+        );
+        // `}` ends the term after `exact`, like `;`.
+        assert_eq!(
+            parse_body_str("by { exact f a }"),
+            "(script (focus (script (exact (app f a)))))"
+        );
+    }
+
+    #[test]
+    fn test_focus_spans() {
+        let source = "theorem t : A := by split; { exact a; exact b }.";
+        let module = parse(source).expect("should parse");
+        let ast::Item::Theorem(theorem) = &module.items[0] else {
+            panic!("expected a theorem");
+        };
+        let ast::Body::Script(script) = &theorem.body else {
+            panic!("expected a tactic script");
+        };
+        let text = |span: crate::diagnostics::Span| &source[span.start..span.end];
+        // A block's span covers its braces.
+        assert_eq!(text(script.tactics[1].span()), "{ exact a; exact b }");
+    }
+
+    #[test]
     fn test_tactic_spans() {
         let source = "theorem t : A := by intro h; exact f h; split.";
         let module = parse(source).expect("should parse");
@@ -1823,7 +1901,8 @@ mod tests {
         assert_eq!(
             diag.notes,
             vec![
-                "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption` and `admit`"
+                "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption`, \
+                 `admit`, `exfalso` and `destruct`"
             ]
         );
 
@@ -1843,6 +1922,22 @@ mod tests {
         assert!(parse("theorem t : A := by split left.").is_err()); // missing `;`
         assert!(parse("theorem t : A := by split").is_err()); // missing `.`
         assert!(parse("theorem t : A := by (split).").is_err()); // not a tactic name
+
+        // An empty block.
+        let source = "theorem t : A := by split; { }.";
+        let diag = parse_error(source);
+        assert_eq!(diag.message, "expected a tactic, found `}`");
+        assert_eq!(diag.labels[0].span.start, source.find("}").unwrap());
+
+        // An unclosed block.
+        let diag = parse_error("theorem t : A := by { exact a.");
+        assert_eq!(diag.message, "expected `}`, found `.`");
+
+        // `destruct` needs `as` and two names.
+        let diag = parse_error("theorem t : A := by destruct h a b.");
+        assert_eq!(diag.message, "expected `as`, found `a`");
+        assert!(parse("theorem t : A := by destruct h as a.").is_err());
+        assert!(parse("theorem t : A := by destruct as a b.").is_err());
     }
 
     #[test]
@@ -1892,6 +1987,10 @@ mod tests {
                 "theorem by : A := x.",
                 "`by` is a keyword and cannot be used as a name",
             ),
+            (
+                "theorem t : A := by intro as.",
+                "`as` is a keyword and cannot be used as a name",
+            ),
             ("theorem t : A = x.", "definitions use `:=`, not `=`"),
             (
                 "proposition P A : A.",
@@ -1923,7 +2022,7 @@ mod tests {
             fun
             case of inl inr
             fst snd
-            absurd trustme by
+            absurd trustme by as
             ()[]{}
             .|,;: := = => -> <->
             foo_bar_1'
@@ -1948,6 +2047,7 @@ mod tests {
             (TokenKind::Absurd, "absurd"),
             (TokenKind::TrustMe, "trustme"),
             (TokenKind::By, "by"),
+            (TokenKind::As, "as"),
             (TokenKind::LeftParen, "("),
             (TokenKind::RightParen, ")"),
             (TokenKind::LeftBracket, "["),

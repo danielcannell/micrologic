@@ -382,6 +382,7 @@ fn lower_tactic(tactic: &surface::ast::Tactic, scope: &TypeScope) -> Result<tact
         surface::ast::Tactic::Assumption(assumption) => lower_assumption(assumption, scope),
         surface::ast::Tactic::Admit(admit) => lower_admit(admit, scope),
         surface::ast::Tactic::ExFalso(exfalso) => lower_exfalso(exfalso, scope),
+        surface::ast::Tactic::Destruct(destruct) => lower_destruct(destruct, scope),
     }
 }
 
@@ -395,7 +396,7 @@ fn lower_focus(focus: &surface::ast::Focus, scope: &TypeScope) -> Result<tactic:
 fn lower_intro(intro: &surface::ast::Intro, _scope: &TypeScope) -> Result<tactic::Tactic> {
     Ok(tactic::Tactic::Intro {
         span: intro.span,
-        name: intro.name.text.clone(),
+        name: lower_name(&intro.name),
     })
 }
 
@@ -433,6 +434,22 @@ fn lower_admit(admit: &surface::ast::Admit, _scope: &TypeScope) -> Result<tactic
 
 fn lower_exfalso(exfalso: &surface::ast::ExFalso, _scope: &TypeScope) -> Result<tactic::Tactic> {
     Ok(tactic::Tactic::ExFalso { span: exfalso.span })
+}
+
+fn lower_destruct(destruct: &surface::ast::Destruct, _scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Destruct {
+        span: destruct.span,
+        hypothesis: lower_name(&destruct.hypothesis),
+        left: lower_name(&destruct.left),
+        right: lower_name(&destruct.right),
+    })
+}
+
+fn lower_name(ident: &surface::ast::Ident) -> tactic::Name {
+    tactic::Name {
+        text: ident.text.clone(),
+        span: ident.span,
+    }
 }
 
 #[cfg(test)]
@@ -790,30 +807,67 @@ mod tests {
         let script = lower_module_script(
             "theorem t A : A -> A := by intro h; split; left; right; assumption; admit; exact h.",
         );
-        let names: Vec<&str> = script
+        assert_eq!(
+            show_script(&script),
+            "(intro h) split left right assumption admit exact"
+        );
+
+        let script = lower_module_script(
+            "theorem t A B : A and B -> A := by intro h; { exfalso }; destruct h as a b.",
+        );
+        assert_eq!(
+            show_script(&script),
+            "(intro h) (focus exfalso) (destruct h a b)"
+        );
+    }
+
+    // The tactics of a lowered script, e.g. `(intro h) split`. Terms in `exact` are left out.
+    fn show_script(script: &tactic::Script) -> String {
+        let tactics: Vec<String> = script
             .tactics
             .iter()
             .map(|tactic| match tactic {
-                tactic::Tactic::Intro { name, .. } => name.as_str(),
-                tactic::Tactic::Exact { .. } => "exact",
-                tactic::Tactic::Split { .. } => "split",
-                tactic::Tactic::Left { .. } => "left",
-                tactic::Tactic::Right { .. } => "right",
-                tactic::Tactic::Assumption { .. } => "assumption",
-                tactic::Tactic::Admit { .. } => "admit",
+                tactic::Tactic::Focus { script, .. } => format!("(focus {})", show_script(script)),
+                tactic::Tactic::Intro { name, .. } => format!("(intro {})", name.text),
+                tactic::Tactic::Exact { .. } => "exact".to_string(),
+                tactic::Tactic::Split { .. } => "split".to_string(),
+                tactic::Tactic::Left { .. } => "left".to_string(),
+                tactic::Tactic::Right { .. } => "right".to_string(),
+                tactic::Tactic::Assumption { .. } => "assumption".to_string(),
+                tactic::Tactic::Admit { .. } => "admit".to_string(),
+                tactic::Tactic::ExFalso { .. } => "exfalso".to_string(),
+                tactic::Tactic::Destruct {
+                    hypothesis,
+                    left,
+                    right,
+                    ..
+                } => format!(
+                    "(destruct {} {} {})",
+                    hypothesis.text, left.text, right.text
+                ),
             })
             .collect();
+        tactics.join(" ")
+    }
+
+    #[test]
+    fn test_script_names_keep_their_spans() {
+        let source = "theorem t A B : A and B -> A := by intro h; destruct h as a b; exact a.";
+        let script = lower_module_script(source);
+        let text = |span: Span| &source[span.start..span.end];
+        let tactic::Tactic::Destruct {
+            hypothesis,
+            left,
+            right,
+            ..
+        } = &script.tactics[1]
+        else {
+            panic!("expected `destruct`");
+        };
+        assert_eq!(hypothesis.span.start, source.find("h as").unwrap());
         assert_eq!(
-            names,
-            vec![
-                "h",
-                "split",
-                "left",
-                "right",
-                "assumption",
-                "admit",
-                "exact"
-            ]
+            (text(hypothesis.span), text(left.span), text(right.span)),
+            ("h", "a", "b")
         );
     }
 

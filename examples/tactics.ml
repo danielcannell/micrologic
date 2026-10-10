@@ -29,3 +29,10 @@ theorem not_not_intro A : A -> not not A := by
 
 theorem exfalso A : False -> A := by
     intro false; exfalso; assumption.
+
+theorem and_swap A B : A and B -> B and A := by
+    intro h;
+    destruct h as a b;
+    split;
+    { exact b };
+    { exact a }.

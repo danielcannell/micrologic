@@ -548,6 +548,14 @@ mod tests {
                 "theorem bad A : A or not A := by right; intro a; exact a.",
                 "mismatched types: expected `False`, found `A`",
             ),
+            (
+                "theorem bad A B : A -> B := by intro a; exfalso; exact a.",
+                "`absurd` expects a proof of `False`",
+            ),
+            (
+                "theorem bad A B : A or B -> A := by intro h; destruct h as a b; exact a.",
+                "`destruct` needs a hypothesis of the form `A and B`",
+            ),
             // The second `h` hides the first, so `exact h` refers to `h : B`.
             (
                 "theorem bad A B : A -> B -> A := by intro h; intro h; exact h.",
