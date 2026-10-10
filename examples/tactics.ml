@@ -59,9 +59,7 @@ axiom excluded_middle A : A or not A.
 
 theorem not_not A : not not A -> A := by
     have h : A or not A;
-    { exact excluded_middle [A] };
-    {
-        cases h as a not_a;
-        { intro _; exact a };
-        { intro h; exfalso; exact h not_a }
-    }.
+    exact excluded_middle [A];
+    cases h as a not_a;
+    { intro _; assumption };
+    { intro h; exfalso; exact h not_a }.

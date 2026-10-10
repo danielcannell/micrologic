@@ -8,12 +8,6 @@ pub struct Script {
     pub tactics: Vec<Tactic>,
 }
 
-impl Script {
-    fn end_span(&self) -> Span {
-        self.tactics.last().map_or(self.span, Tactic::span)
-    }
-}
-
 /// A name written in a script, such as the hypothesis in `intro h`, with where it was written.
 #[derive(Debug, Clone)]
 pub struct Name {
@@ -497,10 +491,21 @@ impl ProofState {
         self.goals.len() > 1
     }
 
-    /// Leave the current block (or the whole script), which must have no goals left. `span` is the
-    /// last tactic run in it.
-    fn pop_focus(&mut self, span: Span) -> Result<()> {
+    /// Leave the current block (or the whole script), which must have no goals left. `script` is
+    /// the block's (or the whole) script.
+    fn pop_focus(&mut self, script: &Script) -> Result<()> {
         let in_block = self.in_block();
+        let what = if in_block { "block" } else { "proof" };
+
+        // Point at the last tactic rather than the whole (possibly many-line) script. An empty
+        // script's span is its `by` or `{`.
+        let (span, label) = match script.tactics.last() {
+            Some(tactic) => (
+                tactic.span(),
+                format!("the {what} is incomplete after this tactic"),
+            ),
+            None => (script.span, format!("the {what} has no tactics yet")),
+        };
         let goals = self
             .goals
             .pop()
@@ -510,11 +515,7 @@ impl ProofState {
             let n = goals.len();
 
             let mut diag = Diagnostic::error(kernel::count(n, "unsolved goal"), span)
-                .with_primary_label(if in_block {
-                    "the block is incomplete after this tactic"
-                } else {
-                    "the proof is incomplete after this tactic"
-                });
+                .with_primary_label(label);
 
             // List the goals in the order the next tactics would work on them: the stack's top first.
             for (i, goal) in goals.iter().rev().enumerate() {
@@ -916,7 +917,7 @@ fn elaborate_focus(
         }
     }
 
-    proof_state.pop_focus(script.end_span())
+    proof_state.pop_focus(script)
 }
 
 #[cfg(test)]
@@ -1595,5 +1596,36 @@ mod tests {
         )
         .unwrap_or_else(|diag| panic!("should accept, but got `{}`", diag.message));
         assert_eq!((summary.proved, summary.admitted), (2, 0));
+    }
+
+    #[test]
+    fn test_empty_script_shows_the_goal() {
+        let source = "theorem t A B : A and B -> B and A := by .";
+        let diag = reject(source);
+        assert_eq!(diag.message, "1 unsolved goal");
+        assert_eq!(
+            primary_label(source, &diag),
+            ("by".to_string(), "the proof has no tactics yet".to_string())
+        );
+        assert_eq!(diag.notes, vec!["the goal is\n⊢ A and B -> B and A"]);
+    }
+
+    #[test]
+    fn test_empty_block_shows_its_goal() {
+        let source =
+            "theorem t A B : A -> B -> B and A := by intro a; intro b; split; { }; { exact a }.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "1 unsolved goal");
+        assert_eq!(
+            primary_label(source, &diag),
+            ("{".to_string(), "the block has no tactics yet".to_string())
+        );
+        assert_eq!(
+            diag.notes,
+            vec![
+                "the goal is\na : A\nb : B\n⊢ B",
+                "a `{ ... }` block must prove its goal before the `}`",
+            ]
+        );
     }
 }

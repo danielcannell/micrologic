@@ -7,7 +7,7 @@
 // proposition := "proposition" IDENT IDENT* ':=' type '.'
 //
 // theorem_body := "by" script | term
-// script       := tactic (';' tactic)*
+// script       := (tactic (';' tactic)*)?
 // tactic       := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso" | "destruct" IDENT "as" IDENT IDENT | "cases" IDENT "as" IDENT IDENT | "have" IDENT ':' type
 //
 // type        := type_lambda ("<->" type)?
@@ -739,8 +739,20 @@ impl<'source> Parser<'source> {
         }
     }
 
-    // script := tactic (';' tactic)*
+    // script := (tactic (';' tactic)*)?
     fn parse_script(&mut self) -> Result<ast::Script> {
+        if matches!(
+            self.current.kind,
+            TokenKind::Dot | TokenKind::RightBrace | TokenKind::Eof
+        ) {
+            // An empty script's span is the `by` or `{` before it, so that's where errors about
+            // it are labelled.
+            return Ok(ast::Script {
+                span: self.previous.span,
+                tactics: Vec::new(),
+            });
+        }
+
         let start = self.current.span;
         let mut tactics = Vec::new();
 
@@ -1917,6 +1929,40 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_scripts() {
+        assert_eq!(parse_body_str("by"), "(script )");
+        assert_eq!(
+            parse_body_str("by split; { }; { exact a }"),
+            "(script split (focus (script )) (focus (script (exact a))))"
+        );
+
+        // An empty script's span is the `by` or `{` before it.
+        let source = "theorem t : A := by split; { }.";
+        let module = parse(source).expect("should parse");
+        let ast::Item::Theorem(theorem) = &module.items[0] else {
+            panic!("expected a theorem");
+        };
+        let ast::Body::Script(script) = &theorem.body else {
+            panic!("expected a tactic script");
+        };
+        let ast::Tactic::Focus(focus) = &script.tactics[1] else {
+            panic!("expected a block");
+        };
+        assert_eq!(focus.script.span.start, source.find("{").unwrap());
+        assert_eq!(focus.script.span.end, source.find("{").unwrap() + 1);
+
+        let source = "theorem t : A := by .";
+        let module = parse(source).expect("should parse");
+        let ast::Item::Theorem(theorem) = &module.items[0] else {
+            panic!("expected a theorem");
+        };
+        let ast::Body::Script(script) = &theorem.body else {
+            panic!("expected a tactic script");
+        };
+        assert_eq!(&source[script.span.start..script.span.end], "by");
+    }
+
+    #[test]
     fn test_focus_spans() {
         let source = "theorem t : A := by split; { exact a; exact b }.";
         let module = parse(source).expect("should parse");
@@ -1974,22 +2020,22 @@ mod tests {
         assert_eq!(diag.message, "expected an identifier, found `;`");
         assert_eq!(diag.labels[0].span.start, source.find(";").unwrap());
 
-        // A script needs at least one tactic.
-        let source = "theorem t : A := by .";
+        // A trailing `;` needs a tactic after it.
+        let source = "theorem t : A := by exact a; .";
         let diag = parse_error(source);
         assert_eq!(diag.message, "expected a tactic, found `.`");
         assert_eq!(diag.labels[0].span.start, source.find(".").unwrap());
+        let diag = parse_error("theorem t : A := by { exact a; }.");
+        assert_eq!(diag.message, "expected a tactic, found `}`");
+
+        // An empty script still needs the closing `.`.
+        let diag = parse_error("theorem t : A := by");
+        assert_eq!(diag.message, "expected `.` at the end of the item");
 
         assert!(parse("theorem t : A := by exact .").is_err()); // `exact` needs a term
         assert!(parse("theorem t : A := by split left.").is_err()); // missing `;`
         assert!(parse("theorem t : A := by split").is_err()); // missing `.`
         assert!(parse("theorem t : A := by (split).").is_err()); // not a tactic name
-
-        // An empty block.
-        let source = "theorem t : A := by split; { }.";
-        let diag = parse_error(source);
-        assert_eq!(diag.message, "expected a tactic, found `}`");
-        assert_eq!(diag.labels[0].span.start, source.find("}").unwrap());
 
         // An unclosed block.
         let diag = parse_error("theorem t : A := by { exact a.");
