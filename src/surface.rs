@@ -8,7 +8,7 @@
 //
 // theorem_body := "by" script | term
 // script       := tactic (';' tactic)*
-// tactic       := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso" | "destruct" IDENT "as" IDENT IDENT
+// tactic       := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso" | "destruct" IDENT "as" IDENT IDENT | "cases" IDENT "as" IDENT IDENT | "have" IDENT ':' type
 //
 // type        := type_lambda ("<->" type)?
 // type_lambda := type_or ("->" type)?
@@ -99,6 +99,8 @@ pub mod ast {
         Admit(Admit),
         ExFalso(ExFalso),
         Destruct(Destruct),
+        Cases(Cases),
+        Have(Have),
     }
 
     impl Tactic {
@@ -114,6 +116,8 @@ pub mod ast {
                 Tactic::Admit(admit) => admit.span,
                 Tactic::ExFalso(ex_false) => ex_false.span,
                 Tactic::Destruct(destruct) => destruct.span,
+                Tactic::Cases(cases) => cases.span,
+                Tactic::Have(have) => have.span,
             }
         }
     }
@@ -172,6 +176,21 @@ pub mod ast {
         pub hypothesis: Ident,
         pub left: Ident,
         pub right: Ident,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Cases {
+        pub span: Span,
+        pub hypothesis: Ident,
+        pub left: Ident,
+        pub right: Ident,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Have {
+        pub span: Span,
+        pub hypothesis: Ident,
+        pub typ: Type,
     }
 
     /// `proposition name params : type .`
@@ -736,9 +755,9 @@ impl<'source> Parser<'source> {
         })
     }
 
-    // tactic := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso" | "destruct" IDENT "as" IDENT IDENT
+    // tactic := '{' script '}' | "intro" IDENT | "exact" term | "split" | "left" | "right" | "assumption" | "admit" | "exfalso" | "destruct" IDENT "as" IDENT IDENT | "cases" IDENT "as" IDENT IDENT | "have" IDENT ':' type
     fn parse_tactic(&mut self) -> Result<ast::Tactic> {
-        const KNOWN_TACTICS: &str = "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption`, `admit`, `exfalso` and `destruct`";
+        const KNOWN_TACTICS: &str = "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption`, `admit`, `exfalso`, `destruct`, `cases` and `have`";
 
         let start = self.current.span;
 
@@ -806,6 +825,28 @@ impl<'source> Parser<'source> {
                     hypothesis,
                     left,
                     right,
+                }))
+            }
+            "cases" => {
+                let hypothesis = self.parse_ident()?;
+                self.expect_token(TokenKind::As)?;
+                let left = self.parse_ident()?;
+                let right = self.parse_ident()?;
+                Ok(ast::Tactic::Cases(ast::Cases {
+                    span: self.span_from(start),
+                    hypothesis,
+                    left,
+                    right,
+                }))
+            }
+            "have" => {
+                let hypothesis = self.parse_ident()?;
+                self.expect_token(TokenKind::Colon)?;
+                let typ = self.parse_type()?;
+                Ok(ast::Tactic::Have(ast::Have {
+                    span: self.span_from(start),
+                    hypothesis,
+                    typ,
                 }))
             }
             _ => Err(Diagnostic::error(format!("unknown tactic `{name}`"), start)
@@ -1519,6 +1560,13 @@ mod tests {
                 "(destruct {} {} {})",
                 destruct.hypothesis.text, destruct.left.text, destruct.right.text
             ),
+            ast::Tactic::Cases(cases) => format!(
+                "(cases {} {} {})",
+                cases.hypothesis.text, cases.left.text, cases.right.text
+            ),
+            ast::Tactic::Have(have) => {
+                format!("(have {} {})", have.hypothesis.text, show_type(&have.typ))
+            }
         }
     }
 
@@ -1834,6 +1882,20 @@ mod tests {
             parse_body_str("by destruct h as h h"),
             "(script (destruct h h h))"
         );
+        assert_eq!(
+            parse_body_str("by cases h as a b"),
+            "(script (cases h a b))"
+        );
+        assert_eq!(
+            parse_body_str("by have h : A or not A; exact h"),
+            "(script (have h (or A (not A))) (exact h))"
+        );
+        // The type after `have` ends at `}` and `.` too.
+        assert_eq!(
+            parse_body_str("by { have h : A -> B }"),
+            "(script (focus (script (have h (-> A B)))))"
+        );
+        assert_eq!(parse_body_str("by have h : A"), "(script (have h A))");
     }
 
     #[test]
@@ -1902,7 +1964,7 @@ mod tests {
             diag.notes,
             vec![
                 "known tactics are: `intro`, `exact`, `split`, `left`, `right`, `assumption`, \
-                 `admit`, `exfalso` and `destruct`"
+                 `admit`, `exfalso`, `destruct`, `cases` and `have`"
             ]
         );
 
@@ -1938,6 +2000,18 @@ mod tests {
         assert_eq!(diag.message, "expected `as`, found `a`");
         assert!(parse("theorem t : A := by destruct h as a.").is_err());
         assert!(parse("theorem t : A := by destruct as a b.").is_err());
+
+        // `cases` has the same shape as `destruct`.
+        let diag = parse_error("theorem t : A := by cases h a b.");
+        assert_eq!(diag.message, "expected `as`, found `a`");
+        assert!(parse("theorem t : A := by cases h as a.").is_err());
+
+        // `have` needs `:` and a type.
+        let diag = parse_error("theorem t : A := by have h A.");
+        assert_eq!(diag.message, "expected `:`, found `A`");
+        let diag = parse_error("theorem t : A := by have h : ; exact h.");
+        assert_eq!(diag.message, "expected a type, found `;`");
+        assert!(parse("theorem t : A := by have : A.").is_err());
     }
 
     #[test]

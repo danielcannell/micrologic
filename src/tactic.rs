@@ -59,6 +59,17 @@ pub enum Tactic {
         left: Name,
         right: Name,
     },
+    Cases {
+        span: Span,
+        hypothesis: Name,
+        left: Name,
+        right: Name,
+    },
+    Have {
+        span: Span,
+        hypothesis: Name,
+        typ: kernel::Type,
+    },
 }
 
 impl Tactic {
@@ -74,6 +85,8 @@ impl Tactic {
             Tactic::Admit { span, .. } => *span,
             Tactic::ExFalso { span, .. } => *span,
             Tactic::Destruct { span, .. } => *span,
+            Tactic::Cases { span, .. } => *span,
+            Tactic::Have { span, .. } => *span,
         }
     }
 }
@@ -117,6 +130,16 @@ impl Goal {
 
     fn lookup_local_by_name(&self, name: &str) -> Option<&Local> {
         self.iter_visible_locals().find(|local| local.name == name)
+    }
+
+    /// The locals that can't be referred to by name, because a later local has the same name,
+    /// newest first.
+    fn iter_hidden_locals(&self) -> impl Iterator<Item = &Local> {
+        let mut seen = HashSet::new();
+        self.locals
+            .iter()
+            .rev()
+            .filter(move |local| !seen.insert(&local.name))
     }
 }
 
@@ -183,6 +206,96 @@ fn wrong_hypothesis_shape(tactic: &str, form: &str, name: &Name, typ: &kernel::T
     .with_primary_label(format!("`{}` has type `{typ}`", name.text))
 }
 
+/// A note for when the hypothesis a tactic needed exists, but is hidden by a later one with the
+/// same name.
+fn hidden_note(hidden: &Local) -> String {
+    format!(
+        "an earlier `{name}` has type `{typ}`, but a later hypothesis with the same name hides it; \
+         give one of them a different name",
+        name = hidden.name,
+        typ = hidden.typ,
+    )
+}
+
+/// `exact` was given a term that mentions a name that isn't in scope at this goal.
+fn unknown_name_in_exact(
+    name: &str,
+    span: Span,
+    goal: &Goal,
+    proof_state: &ProofState,
+) -> Diagnostic {
+    let mut diag = Diagnostic::error(format!("cannot find `{name}` in this scope"), span)
+        .with_primary_label("not a hypothesis, theorem or axiom");
+
+    // Most likely a hypothesis that only exists in a later goal, e.g. the `h` of `have h : T`
+    // used in its own proof.
+    if proof_state
+        .open_goals()
+        .any(|other| other.lookup_local_by_name(name).is_some())
+    {
+        diag = diag.with_note(format!(
+            "`{name}` is a hypothesis of a later goal, but not of this one; for example, the \
+             hypothesis of a `have` can't be used in its own proof"
+        ));
+    }
+
+    diag.with_note(goal_note(goal))
+}
+
+/// The names a term refers to that aren't bound inside it, with where each is used, in order.
+fn free_names(term: &kernel::Term) -> Vec<(&str, Span)> {
+    fn walk<'a>(term: &'a kernel::Term, bound: &mut Vec<&'a str>, free: &mut Vec<(&'a str, Span)>) {
+        use kernel::Term;
+        match term {
+            Term::Var { span, name, .. } => {
+                if !bound.contains(&name.as_str()) {
+                    free.push((name, *span));
+                }
+            }
+            Term::Lambda { argument, body, .. } => {
+                bound.push(argument);
+                walk(body, bound, free);
+                bound.pop();
+            }
+            Term::Application {
+                function, argument, ..
+            } => {
+                walk(function, bound, free);
+                walk(argument, bound, free);
+            }
+            Term::Pair { left, right, .. } => {
+                walk(left, bound, free);
+                walk(right, bound, free);
+            }
+            Term::Fst { pair, .. } | Term::Snd { pair, .. } => walk(pair, bound, free),
+            Term::Inl { left, .. } => walk(left, bound, free),
+            Term::Inr { right, .. } => walk(right, bound, free),
+            Term::Case {
+                either,
+                left_name,
+                left_body,
+                right_name,
+                right_body,
+                ..
+            } => {
+                walk(either, bound, free);
+                bound.push(left_name);
+                walk(left_body, bound, free);
+                bound.pop();
+                bound.push(right_name);
+                walk(right_body, bound, free);
+                bound.pop();
+            }
+            Term::Absurd { body, .. } => walk(body, bound, free),
+            Term::TrustMe { .. } => {}
+        }
+    }
+
+    let mut free = Vec::new();
+    walk(term, &mut Vec::new(), &mut free);
+    free
+}
+
 /// A reference to a hypothesis.
 fn var(span: Span, name: &str) -> kernel::Term {
     kernel::Term::Var {
@@ -234,6 +347,14 @@ enum Partial {
         span: Span,
         function: Box<Partial>,
         argument: Box<Partial>,
+    },
+    Case {
+        span: Span,
+        either: kernel::Term,
+        left_name: String,
+        left_body: Box<Partial>,
+        right_name: String,
+        right_body: Box<Partial>,
     },
 }
 
@@ -297,6 +418,21 @@ impl Partial {
                 function: Box::new(function.fill(solutions)),
                 argument: Box::new(argument.fill(solutions)),
             },
+            Partial::Case {
+                span,
+                either,
+                left_name,
+                left_body,
+                right_name,
+                right_body,
+            } => kernel::Term::Case {
+                span,
+                either: Box::new(either),
+                left_name,
+                left_body: Box::new(left_body.fill(solutions)),
+                right_name,
+                right_body: Box::new(right_body.fill(solutions)),
+            },
         }
     }
 }
@@ -344,6 +480,11 @@ impl ProofState {
             .last_mut()
             .expect("should always be at least one level of goals")
             .pop()
+    }
+
+    /// Every open goal, in all blocks.
+    fn open_goals(&self) -> impl Iterator<Item = &Goal> {
+        self.goals.iter().flatten()
     }
 
     fn push_focus(&mut self, goal: Goal) {
@@ -477,6 +618,14 @@ fn elaborate_focus(
                 }
             }
             Tactic::Exact { span: _, term } => {
+                // The kernel checks the term, but a name that isn't in scope is reported here,
+                // where the goal is known and can be shown.
+                for (name, name_span) in free_names(term) {
+                    if goal.lookup_local_by_name(name).is_none() && ctx.lookup(name).is_none() {
+                        return Err(unknown_name_in_exact(name, name_span, &goal, proof_state));
+                    }
+                }
+
                 let solution = Partial::Term { term: term.clone() };
                 proof_state.add_solution(goal.id, solution);
             }
@@ -556,14 +705,11 @@ fn elaborate_focus(
                         .with_primary_label(format!("no hypothesis has type `{}`", goal.target));
 
                     // Every local of the right type is hidden, so the fix is to rename.
-                    if let Some(hidden) = goal.locals.iter().find(|local| local.typ == goal.target)
+                    if let Some(hidden) = goal
+                        .iter_hidden_locals()
+                        .find(|local| local.typ == goal.target)
                     {
-                        diag = diag.with_note(format!(
-                            "`{name}` has type `{typ}`, but it is hidden by a later hypothesis \
-                             also named `{name}`; use a different name in one of the `intro`s",
-                            name = hidden.name,
-                            typ = hidden.typ,
-                        ));
+                        diag = diag.with_note(hidden_note(hidden));
                     }
 
                     return Err(diag.with_note(goal_note(&goal)));
@@ -614,22 +760,10 @@ fn elaborate_focus(
                         wrong_hypothesis_shape("destruct", "A and B", hypothesis, &local.typ);
 
                     // An earlier local with the same name might be the pair that was meant.
-                    let hidden = goal
-                        .locals
-                        .iter()
-                        .rev()
-                        .skip_while(|l| l.name != local.name)
-                        .skip(1);
-                    if let Some(hidden) = hidden
-                        .filter(|l| l.name == local.name)
-                        .find(|l| matches!(l.typ, kernel::Type::Pair { .. }))
-                    {
-                        diag = diag.with_note(format!(
-                            "an earlier `{name}` has type `{typ}`, but it is hidden by this one; use \
-                             a different name in one of the `intro`s",
-                            name = hidden.name,
-                            typ = hidden.typ,
-                        ));
+                    if let Some(hidden) = goal.iter_hidden_locals().find(|hidden| {
+                        hidden.name == local.name && matches!(hidden.typ, kernel::Type::Pair { .. })
+                    }) {
+                        diag = diag.with_note(hidden_note(hidden));
                     }
 
                     return Err(diag.with_note(goal_note(&goal)));
@@ -683,6 +817,98 @@ fn elaborate_focus(
                         argument: Box::new(Partial::Term { term: fst }),
                     }),
                     argument: Box::new(Partial::Term { term: snd }),
+                };
+
+                proof_state.add_solution(goal.id, solution);
+            }
+            Tactic::Cases {
+                span,
+                hypothesis,
+                left,
+                right,
+            } => {
+                let Some(local) = goal.lookup_local_by_name(&hypothesis.text) else {
+                    return Err(unknown_hypothesis(ctx, "cases", hypothesis, &goal));
+                };
+                let kernel::Type::Either {
+                    left_type,
+                    right_type,
+                } = &local.typ
+                else {
+                    let mut diag =
+                        wrong_hypothesis_shape("cases", "A or B", hypothesis, &local.typ);
+
+                    // An earlier local with the same name might be the either that was meant.
+                    if let Some(hidden) = goal.iter_hidden_locals().find(|hidden| {
+                        hidden.name == local.name
+                            && matches!(hidden.typ, kernel::Type::Either { .. })
+                    }) {
+                        diag = diag.with_note(hidden_note(hidden));
+                    }
+
+                    return Err(diag.with_note(goal_note(&goal)));
+                };
+                let left_type = (**left_type).clone();
+                let right_type = (**right_type).clone();
+
+                let mut right_locals = goal.locals.clone();
+                right_locals.push(Local {
+                    name: right.text.clone(),
+                    typ: right_type.clone(),
+                });
+                let right_goal_id = proof_state.push_new_goal(right_locals, goal.target.clone());
+
+                let mut left_locals = goal.locals.clone();
+                left_locals.push(Local {
+                    name: left.text.clone(),
+                    typ: left_type.clone(),
+                });
+                let left_goal_id = proof_state.push_new_goal(left_locals, goal.target.clone());
+
+                let solution = Partial::Case {
+                    span: *span,
+                    either: var(hypothesis.span, &hypothesis.text),
+                    left_name: left.text.clone(),
+                    left_body: Box::new(Partial::Hole {
+                        goal_id: left_goal_id,
+                    }),
+                    right_name: right.text.clone(),
+                    right_body: Box::new(Partial::Hole {
+                        goal_id: right_goal_id,
+                    }),
+                };
+
+                proof_state.add_solution(goal.id, solution);
+            }
+            Tactic::Have {
+                span,
+                hypothesis,
+                typ,
+            } => {
+                // Transform `have h : T` to `(fun (h : T) => ?1) ?2` where:
+                //     ?1 is goal.locals, h : T ⊢ goal.target
+                //     ?2 is goal.locals ⊢ T
+
+                let mut new_locals = goal.locals.clone();
+                new_locals.push(Local {
+                    name: hypothesis.text.clone(),
+                    typ: typ.clone(),
+                });
+                let new_goal_id = proof_state.push_new_goal(new_locals, goal.target.clone());
+
+                let h_goal_id = proof_state.push_new_goal(goal.locals.clone(), typ.clone());
+
+                let solution = Partial::Application {
+                    span: *span,
+                    function: Box::new(Partial::Lambda {
+                        span: *span,
+                        argument: hypothesis.text.clone(),
+                        argument_type: typ.clone(),
+                        body: Box::new(Partial::Hole {
+                            goal_id: new_goal_id,
+                        }),
+                    }),
+                    argument: Box::new(Partial::Hole { goal_id: h_goal_id }),
                 };
 
                 proof_state.add_solution(goal.id, solution);
@@ -995,8 +1221,8 @@ mod tests {
         assert_eq!(
             diag.notes,
             vec![
-                "`h` has type `A`, but it is hidden by a later hypothesis also named `h`; use a \
-                 different name in one of the `intro`s",
+                "an earlier `h` has type `A`, but a later hypothesis with the same name hides it; \
+                 give one of them a different name",
                 "the goal is\nh : B\n⊢ A",
             ]
         );
@@ -1153,8 +1379,8 @@ mod tests {
         assert_eq!(
             diag.notes,
             vec![
-                "an earlier `h` has type `A and B`, but it is hidden by this one; use a different \
-                 name in one of the `intro`s",
+                "an earlier `h` has type `A and B`, but a later hypothesis with the same name hides it; \
+                 give one of them a different name",
                 "the goal is\nh : C\n⊢ A",
             ]
         );
@@ -1200,5 +1426,174 @@ mod tests {
         let diag = reject("theorem t A : A -> A := by intro a; exact a; { exact a }.");
         assert_eq!(diag.message, "no goals left");
         assert_eq!(diag.notes, vec!["try removing the tactic"]);
+    }
+
+    #[test]
+    fn test_cases() {
+        assert_eq!(
+            elaborate_str(
+                "theorem t A B : A or B -> B or A := by \
+                 intro h; cases h as a b; { right; exact a }; { left; exact b }."
+            ),
+            "(fun h [A or B] (case h a (inr [B] a) b (inl [A] b)))"
+        );
+        // Without blocks, the left branch's goal comes first.
+        assert_eq!(
+            elaborate_str(
+                "theorem t A B : A or B -> B or A := by \
+                 intro h; cases h as a b; right; exact a; left; exact b."
+            ),
+            "(fun h [A or B] (case h a (inr [B] a) b (inl [A] b)))"
+        );
+    }
+
+    #[test]
+    fn test_cases_uses_the_visible_hypothesis() {
+        assert_eq!(
+            elaborate_str(
+                "theorem t A B C : C -> A or B -> B or A := by \
+                 intro h; intro h; cases h as a b; { right; exact a }; { left; exact b }."
+            ),
+            "(fun h [C] (fun h [A or B] (case h a (inr [B] a) b (inl [A] b))))"
+        );
+    }
+
+    #[test]
+    fn test_have() {
+        // `have h : T` is `(fun (h : T) => <rest>) <proof of T>`, and the proof of `T` comes
+        // first.
+        assert_eq!(
+            elaborate_str(
+                "theorem t A B : A -> A and A := by intro a; have h : A; exact a; split; exact h; exact h."
+            ),
+            "(fun a [A] (app (fun h [A] (pair h h)) a))"
+        );
+    }
+
+    #[test]
+    fn test_new_tactics_are_accepted_by_the_kernel() {
+        // The elaborator's tests above don't run the kernel; check these terms really type-check.
+        let summary = crate::process_module(
+            r#"
+            theorem or_comm A B : A or B -> B or A := by
+                intro h; cases h as a b; { right; exact a }; { left; exact b }.
+            theorem reuse A B : A or B -> B or A := by
+                intro h; cases h as h h; { right; exact h }; { left; exact h }.
+            theorem have_twice A : A -> A and A := by
+                intro a; have h : A; { exact a }; have k : A; { exact h }; split; exact h; exact k.
+            theorem have_then_cases A B : (A or B) and (A -> B) -> B := by
+                intro p; destruct p as ab f; have g : B -> B; { intro b; exact b };
+                cases ab as a b; { exact f a }; { exact g b }.
+            "#,
+        )
+        .unwrap_or_else(|diag| panic!("should accept, but got `{}`", diag.message));
+        assert_eq!((summary.proved, summary.admitted), (4, 0));
+    }
+
+    #[test]
+    fn test_have_does_not_leak_into_its_own_proof() {
+        // The proof of `T` doesn't have `h` in scope, either in the goal...
+        let diag = reject("theorem t A : A := by have h : A; { split }; { exact h }.");
+        assert_eq!(diag.notes, vec!["the goal is\n⊢ A"]);
+
+        // ...or in the term: the kernel can't find `h` there.
+        let source = "theorem t A : A := by have h : A; { exact h }; { exact h }.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "cannot find `h` in this scope");
+        assert_eq!(
+            diag.notes,
+            vec![
+                "`h` is a hypothesis of a later goal, but not of this one; for example, the \
+                 hypothesis of a `have` can't be used in its own proof",
+                "the goal is\n⊢ A",
+            ]
+        );
+        assert_eq!(
+            diag.labels[0].span.start,
+            source.find("exact h").unwrap() + "exact ".len()
+        );
+    }
+
+    #[test]
+    fn test_cases_errors() {
+        let source = "theorem t A : A -> A := by intro h; cases x as a b; exact h.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "cannot find hypothesis `x`");
+        assert_eq!(
+            primary_label(source, &diag),
+            ("x".to_string(), "not a hypothesis".to_string())
+        );
+
+        let diag =
+            reject("axiom em A : A or not A.\ntheorem t A : A := by cases em as a b; admit.");
+        assert_eq!(
+            diag.notes,
+            vec![
+                "`em` is a theorem or axiom, but `cases` only works on hypotheses",
+                "the goal is\n⊢ A",
+            ]
+        );
+
+        let source = "theorem t A B : A and B -> A := by intro h; cases h as a b; exact a.";
+        let diag = reject(source);
+        assert_eq!(
+            diag.message,
+            "`cases` needs a hypothesis of the form `A or B`"
+        );
+        assert_eq!(
+            primary_label(source, &diag),
+            ("h".to_string(), "`h` has type `A and B`".to_string())
+        );
+
+        let diag = reject(
+            "theorem t A B C : A or B -> C -> A := by intro h; intro h; cases h as a b; exact a.",
+        );
+        assert_eq!(
+            diag.notes,
+            vec![
+                "an earlier `h` has type `A or B`, but a later hypothesis with the same name hides it; \
+                 give one of them a different name",
+                "the goal is\nh : C\n⊢ A",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cases_with_unsolved_branch() {
+        let source =
+            "theorem t A B : A or B -> B or A := by intro h; cases h as a b; right; exact a.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "1 unsolved goal");
+        assert_eq!(diag.notes, vec!["the goal is\nh : A or B\nb : B\n⊢ B or A"]);
+    }
+
+    #[test]
+    fn test_exact_with_unknown_name() {
+        let source = "theorem t A : A -> A := by intro a; exact b.";
+        let diag = reject(source);
+        assert_eq!(diag.message, "cannot find `b` in this scope");
+        assert_eq!(
+            primary_label(source, &diag),
+            (
+                "b".to_string(),
+                "not a hypothesis, theorem or axiom".to_string()
+            )
+        );
+        // No "later goal" note: `b` isn't a hypothesis anywhere.
+        assert_eq!(diag.notes, vec!["the goal is\na : A\n⊢ A"]);
+    }
+
+    #[test]
+    fn test_exact_names_bound_inside_the_term_are_fine() {
+        // `x`, `l` and `r` are bound by the term itself, and `id` is a theorem.
+        let summary = crate::process_module(
+            r#"
+            theorem id A : A -> A := fun (x : A) => x.
+            theorem t A B : A or B -> B or A := by
+                exact fun (x : A or B) => case x of | inl l => inr [B] (id [A] l) | inr r => inl [A] r.
+            "#,
+        )
+        .unwrap_or_else(|diag| panic!("should accept, but got `{}`", diag.message));
+        assert_eq!((summary.proved, summary.admitted), (2, 0));
     }
 }

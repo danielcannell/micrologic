@@ -383,6 +383,8 @@ fn lower_tactic(tactic: &surface::ast::Tactic, scope: &TypeScope) -> Result<tact
         surface::ast::Tactic::Admit(admit) => lower_admit(admit, scope),
         surface::ast::Tactic::ExFalso(exfalso) => lower_exfalso(exfalso, scope),
         surface::ast::Tactic::Destruct(destruct) => lower_destruct(destruct, scope),
+        surface::ast::Tactic::Cases(cases) => lower_cases(cases, scope),
+        surface::ast::Tactic::Have(have) => lower_have(have, scope),
     }
 }
 
@@ -442,6 +444,23 @@ fn lower_destruct(destruct: &surface::ast::Destruct, _scope: &TypeScope) -> Resu
         hypothesis: lower_name(&destruct.hypothesis),
         left: lower_name(&destruct.left),
         right: lower_name(&destruct.right),
+    })
+}
+
+fn lower_cases(cases: &surface::ast::Cases, _scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Cases {
+        span: cases.span,
+        hypothesis: lower_name(&cases.hypothesis),
+        left: lower_name(&cases.left),
+        right: lower_name(&cases.right),
+    })
+}
+
+fn lower_have(have: &surface::ast::Have, scope: &TypeScope) -> Result<tactic::Tactic> {
+    Ok(tactic::Tactic::Have {
+        span: have.span,
+        hypothesis: lower_name(&have.hypothesis),
+        typ: lower_type(&have.typ, scope)?,
     })
 }
 
@@ -819,6 +838,10 @@ mod tests {
             show_script(&script),
             "(intro h) (focus exfalso) (destruct h a b)"
         );
+
+        let script =
+            lower_module_script("theorem t A B : A := by have h : A or not B; cases h as a b.");
+        assert_eq!(show_script(&script), "(have h [A or not B]) (cases h a b)");
     }
 
     // The tactics of a lowered script, e.g. `(intro h) split`. Terms in `exact` are left out.
@@ -845,6 +868,15 @@ mod tests {
                     "(destruct {} {} {})",
                     hypothesis.text, left.text, right.text
                 ),
+                tactic::Tactic::Cases {
+                    hypothesis,
+                    left,
+                    right,
+                    ..
+                } => format!("(cases {} {} {})", hypothesis.text, left.text, right.text),
+                tactic::Tactic::Have {
+                    hypothesis, typ, ..
+                } => format!("(have {} [{typ}])", hypothesis.text),
             })
             .collect();
         tactics.join(" ")
@@ -882,11 +914,27 @@ mod tests {
             lower_error("theorem t A : A -> A := by exact fun (x : Q) => x."),
             unbound("Q")
         );
+        // The type in `have` is resolved too.
+        assert_eq!(
+            lower_error("theorem t A : A := by have h : A or Q; admit."),
+            unbound("Q")
+        );
         // Even after an earlier tactic that is fine.
         assert_eq!(
             lower_error("theorem t A : A -> A := by intro a; split; exact absurd [Q] a."),
             unbound("Q")
         );
+    }
+
+    #[test]
+    fn test_alias_in_have() {
+        let source =
+            format!("{KNIGHTS_AND_KNAVES}\ntheorem t A : A := by have h : Knave A; admit.");
+        let script = lower_module_script(&source);
+        match &script.tactics[0] {
+            tactic::Tactic::Have { typ, .. } => assert_eq!(*typ, lower_type_str("", "not A")),
+            _ => panic!("expected `have`"),
+        }
     }
 
     #[test]
